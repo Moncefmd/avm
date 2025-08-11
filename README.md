@@ -6,7 +6,7 @@
 
 ### From GitHub Releases (Recommended)
 
-You can download the latest pre-compiled binary for your operating system and architecture from the [GitHub Releases](https://github.com/user/avm/releases) page.
+You can download the latest pre-compiled binary for your operating system and architecture from the [GitHub Releases](https://github.com/Moncefmd/avm/releases) page.
 
 Once downloaded, make sure the binary is executable (`chmod +x avm`) and move it to a directory in your `PATH`.
 
@@ -15,7 +15,7 @@ Once downloaded, make sure the binary is executable (`chmod +x avm`) and move it
 If you have Go installed, you can also build `avm` from source:
 
 ```sh
-git clone https://github.com/user/avm.git
+git clone https://github.com/Moncefmd/avm.git
 cd avm
 go build
 ```
@@ -88,7 +88,7 @@ avm uninstall v2.3.5
 
 ## Contributing
 
-Contributions are welcome! If you find a bug or have a feature request, please open an issue on the [GitHub repository](https://github.com/user/avm/issues).
+Contributions are welcome! If you find a bug or have a feature request, please open an issue on the [GitHub repository](https://github.com/Moncefmd/avm/issues).
 
 ## License
 

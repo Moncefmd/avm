@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/user/avm/cmd"
+	"github.com/Moncefmd/avm/cmd"
 )
 
 func main() {

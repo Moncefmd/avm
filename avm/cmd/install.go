@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/user/avm/internal"
+	"github.com/Moncefmd/avm/internal"
 )
 
 var installCmd = &cobra.Command{

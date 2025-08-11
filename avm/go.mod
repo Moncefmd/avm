@@ -1,4 +1,4 @@
-module github.com/user/avm
+module github.com/Moncefmd/avm
 
 go 1.24.3
 
