@@ -76,6 +76,20 @@ Installed versions:
   v2.5.0
 ```
 
+### `avm list-remote [version]`
+
+List remote versions available for download. If no version is specified, it lists all available `argocd` versions (tags). If a version is specified, it lists the available binaries for that version.
+
+**Examples:**
+
+```sh
+# List all available versions
+avm list-remote
+
+# List available binaries for version 2.4.0
+avm list-remote v2.4.0
+```
+
 ### `avm uninstall <version>`
 
 Uninstall a specific version of `argocd`.

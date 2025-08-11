@@ -55,3 +55,22 @@ func GetRelease(version string) (*Release, error) {
 
 	return &release, nil
 }
+
+func GetAllReleases() ([]Release, error) {
+	resp, err := http.Get(GithubAPIURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get releases: %s", resp.Status)
+	}
+
+	var releases []Release
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, err
+	}
+
+	return releases, nil
+}

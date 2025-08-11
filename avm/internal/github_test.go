@@ -63,3 +63,35 @@ func TestGetRelease(t *testing.T) {
 		t.Errorf("expected asset name argocd-linux-amd64, got %s", release.Assets[0].Name)
 	}
 }
+
+func TestGetAllReleases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" { // The base URL of the server is the releases endpoint
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"tag_name": "v1.2.3"}, {"tag_name": "v1.2.4"}]`))
+	}))
+	defer server.Close()
+
+	originalURL := GithubAPIURL
+	GithubAPIURL = server.URL
+	defer func() { GithubAPIURL = originalURL }()
+
+	releases, err := GetAllReleases()
+	if err != nil {
+		t.Fatalf("GetAllReleases returned an error: %v", err)
+	}
+
+	if len(releases) != 2 {
+		t.Fatalf("expected 2 releases, got %d", len(releases))
+	}
+
+	if releases[0].TagName != "v1.2.3" {
+		t.Errorf("expected first release tag_name v1.2.3, got %s", releases[0].TagName)
+	}
+
+	if releases[1].TagName != "v1.2.4" {
+		t.Errorf("expected second release tag_name v1.2.4, got %s", releases[1].TagName)
+	}
+}
