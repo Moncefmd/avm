@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,4 +25,38 @@ func GetActiveVersion(homeDir string) (string, error) {
 		return parts[len(parts)-2], nil
 	}
 	return "", nil // Could not determine version from path
+}
+
+func UseVersion(version string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("error getting home directory: %w", err)
+	}
+
+	versionDir := filepath.Join(homeDir, ".avm", "versions", version)
+	binaryPath := filepath.Join(versionDir, "argocd")
+
+	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		return fmt.Errorf("version %s is not installed. Please run 'avm install %s' first", version, version)
+	}
+
+	binDir := filepath.Join(homeDir, ".avm", "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return fmt.Errorf("error creating bin directory: %w", err)
+	}
+
+	symlinkPath := filepath.Join(binDir, "argocd")
+
+	// Remove existing symlink
+	if _, err := os.Lstat(symlinkPath); err == nil {
+		if err := os.Remove(symlinkPath); err != nil {
+			return fmt.Errorf("error removing existing symlink: %w", err)
+		}
+	}
+
+	if err := os.Symlink(binaryPath, symlinkPath); err != nil {
+		return fmt.Errorf("error creating symlink: %w", err)
+	}
+
+	return nil
 }

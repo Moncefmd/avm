@@ -78,6 +78,13 @@ var installCmd = &cobra.Command{
 		}
 
 		fmt.Printf("argocd version %s installed successfully!\n", version)
+
+		// Automatically use the installed version
+		if err := internal.UseVersion(version); err != nil {
+			fmt.Println("Error switching to new version:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Now using argocd version %s\n", version)
 	},
 }
 

@@ -24,6 +24,8 @@ This will create an `avm` binary in the project directory.
 
 ## Setup
 
+**Important:** Before you start using `avm`, it's recommended to uninstall any existing installation of the `argocd` CLI that was not installed by `avm`. This will prevent any conflicts between different installations.
+
 After installing `avm`, you need to add its `bin` directory to your `PATH`. This is where `avm` will place the symlink to the active `argocd` version.
 
 Add the following line to your shell's configuration file (e.g., `~/.bashrc`, `~/.zshrc`):
