@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/spf13/cobra"
 	"github.com/Moncefmd/avm/internal"
+	"github.com/spf13/cobra"
 )
 
 var installCmd = &cobra.Command{
@@ -85,7 +87,54 @@ var installCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		fmt.Printf("Now using argocd version %s\n", version)
+
+		handlePathSetup()
 	},
+}
+
+func handlePathSetup() {
+	inPath, err := internal.IsAvmInPath()
+	if err != nil {
+		// Silently ignore errors here, as this is a non-critical check
+		return
+	}
+
+	if !inPath {
+		shellConfig, err := internal.GetShellConfig()
+		if err != nil {
+			// If we can't detect the shell, just print a generic message
+			fmt.Println("\nWARNING: avm bin directory is not in your PATH.")
+			fmt.Println("Please add the following line to your shell configuration file:")
+			fmt.Println(`  export PATH="$HOME/.avm/bin:$PATH"`)
+			return
+		}
+
+		fmt.Printf("\nWARNING: Your PATH is not configured correctly.\n")
+		fmt.Printf("To use avm, please add the following line to your shell configuration file at %s:\n\n", shellConfig.ConfigFile)
+		fmt.Printf("  %s\n\n", shellConfig.ExportCommand)
+		fmt.Printf("Would you like me to add this line for you? [y/n] ")
+
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		if strings.TrimSpace(strings.ToLower(input)) == "y" {
+			f, err := os.OpenFile(shellConfig.ConfigFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				fmt.Printf("\nError opening config file: %v\n", err)
+				fmt.Println("Please add the line manually.")
+				return
+			}
+			defer f.Close()
+
+			if _, err := f.WriteString("\n" + shellConfig.ExportCommand + "\n"); err != nil {
+				fmt.Printf("\nError writing to config file: %v\n", err)
+				fmt.Println("Please add the line manually.")
+				return
+			}
+			fmt.Println("\nConfiguration file updated. Please restart your shell or run `source " + shellConfig.ConfigFile + "` to apply the changes.")
+		} else {
+			fmt.Println("\nInstallation complete. Please configure your PATH manually.")
+		}
+	}
 }
 
 func init() {
