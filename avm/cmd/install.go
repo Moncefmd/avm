@@ -16,6 +16,15 @@ var installCmd = &cobra.Command{
 	Short: "Install a specific version of argocd",
 	Long:  `Install a specific version of argocd. Use "latest" to install the latest version.`,
 	Args:  cobra.ExactArgs(1),
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		versions, err := internal.GetRemoteVersions()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		// Add "latest" to the list of versions
+		versions = append(versions, "latest")
+		return versions, cobra.ShellCompDirectiveNoFileComp
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		version := args[0]
 

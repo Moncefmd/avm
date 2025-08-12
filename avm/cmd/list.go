@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/Moncefmd/avm/internal"
@@ -14,29 +13,10 @@ var listCmd = &cobra.Command{
 	Short: "List all installed versions of argocd",
 	Long:  `List all installed versions of argocd.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		homeDir, err := os.UserHomeDir()
+		installedVersions, err := internal.GetInstalledVersions()
 		if err != nil {
-			fmt.Println("Error getting home directory:", err)
+			fmt.Println("Error getting installed versions:", err)
 			os.Exit(1)
-		}
-
-		versionsDir := filepath.Join(homeDir, ".avm", "versions")
-		if _, err := os.Stat(versionsDir); os.IsNotExist(err) {
-			fmt.Println("No versions installed yet.")
-			return
-		}
-
-		entries, err := os.ReadDir(versionsDir)
-		if err != nil {
-			fmt.Println("Error reading versions directory:", err)
-			os.Exit(1)
-		}
-
-		var installedVersions []string
-		for _, entry := range entries {
-			if entry.IsDir() {
-				installedVersions = append(installedVersions, entry.Name())
-			}
 		}
 
 		if len(installedVersions) == 0 {
@@ -44,6 +24,11 @@ var listCmd = &cobra.Command{
 			return
 		}
 
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Println("Error getting home directory:", err)
+			os.Exit(1)
+		}
 		activeVersion, err := internal.GetActiveVersion(homeDir)
 		if err != nil {
 			fmt.Println("Error getting active version:", err)

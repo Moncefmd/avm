@@ -74,3 +74,17 @@ func GetAllReleases() ([]Release, error) {
 
 	return releases, nil
 }
+
+func GetRemoteVersions() ([]string, error) {
+	releases, err := GetAllReleases()
+	if err != nil {
+		return nil, err
+	}
+
+	versions := make([]string, len(releases))
+	for i, release := range releases {
+		versions[i] = release.TagName
+	}
+
+	return versions, nil
+}
