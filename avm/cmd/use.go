@@ -13,6 +13,13 @@ var useCmd = &cobra.Command{
 	Short: "Switch to a specific version of argocd",
 	Long:  `Switch to a specific version of argocd.`,
 	Args:  cobra.ExactArgs(1),
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		versions, err := internal.GetInstalledVersions()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+		return versions, cobra.ShellCompDirectiveNoFileComp
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		version := args[0]
 		if err := internal.UseVersion(version); err != nil {

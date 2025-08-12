@@ -17,13 +17,13 @@ var listRemoteCmd = &cobra.Command{
 		if len(args) == 0 {
 			// List all available versions
 			fmt.Println("Available versions:")
-			releases, err := internal.GetAllReleases()
+			versions, err := internal.GetRemoteVersions()
 			if err != nil {
 				fmt.Println("Error getting releases:", err)
 				os.Exit(1)
 			}
-			for _, release := range releases {
-				fmt.Println(release.TagName)
+			for _, version := range versions {
+				fmt.Println(version)
 			}
 		} else {
 			// List available binaries for a specific version
