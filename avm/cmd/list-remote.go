@@ -17,6 +17,7 @@ var listRemoteCmd = &cobra.Command{
 		if len(args) == 0 {
 			// List all available versions
 			fmt.Println("Available versions:")
+			// Force refresh by calling GetRemoteVersions (which calls GetRemoteVersionsWithCache(false))
 			versions, err := internal.GetRemoteVersions()
 			if err != nil {
 				fmt.Println("Error getting releases:", err)
