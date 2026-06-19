@@ -24,7 +24,7 @@ var uninstallCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		version := args[0]
 
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := internal.GetHomeDir()
 		if err != nil {
 			fmt.Println("Error getting home directory:", err)
 			os.Exit(1)

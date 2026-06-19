@@ -28,7 +28,7 @@ func GetActiveVersion(homeDir string) (string, error) {
 }
 
 func UseVersion(version string) error {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := GetHomeDir()
 	if err != nil {
 		return fmt.Errorf("error getting home directory: %w", err)
 	}

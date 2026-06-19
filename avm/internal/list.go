@@ -6,7 +6,7 @@ import (
 )
 
 func GetInstalledVersions() ([]string, error) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := GetHomeDir()
 	if err != nil {
 		return nil, err
 	}

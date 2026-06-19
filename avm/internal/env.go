@@ -8,7 +8,7 @@ import (
 
 // IsAvmInPath checks if the avm bin directory is in the PATH.
 func IsAvmInPath() (bool, error) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := GetHomeDir()
 	if err != nil {
 		return false, err
 	}
@@ -40,7 +40,7 @@ func GetShellConfig() (*ShellConfig, error) {
 		return nil, fmt.Errorf("could not detect shell: SHELL environment variable not set")
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := GetHomeDir()
 	if err != nil {
 		return nil, err
 	}

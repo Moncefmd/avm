@@ -64,7 +64,7 @@ var installCmd = &cobra.Command{
 
 		fmt.Printf("Downloading from %s\n", downloadURL)
 
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := internal.GetHomeDir()
 		if err != nil {
 			fmt.Println("Error getting home directory:", err)
 			os.Exit(1)

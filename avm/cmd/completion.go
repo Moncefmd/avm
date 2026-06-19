@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Moncefmd/avm/internal"
 	"github.com/spf13/cobra"
 )
 
@@ -74,7 +75,7 @@ func init() {
 }
 
 func installCompletion(shell string) error {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := internal.GetHomeDir()
 	if err != nil {
 		return err
 	}

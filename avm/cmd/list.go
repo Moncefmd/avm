@@ -24,7 +24,7 @@ var listCmd = &cobra.Command{
 			return
 		}
 
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := internal.GetHomeDir()
 		if err != nil {
 			fmt.Println("Error getting home directory:", err)
 			os.Exit(1)
