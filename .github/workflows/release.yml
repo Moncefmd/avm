@@ -2,52 +2,107 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
+  verify:
+    name: Verify tag and source
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Go
-        uses: actions/setup-go@v3
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: '1.24.3'
-
-      - name: Build binaries
+          toolchain: 1.97.1
+          components: clippy
+      - name: Match Cargo version to tag
+        shell: bash
         run: |
-          cd avm
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o ../avm-${{ matrix.goos }}-${{ matrix.goarch }}
-        env:
-          CGO_ENABLED: 0
+          manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test "v${manifest_version}" = "${GITHUB_REF_NAME}"
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: avm-linux-amd64
+            executable: avm
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: avm-linux-arm64
+            executable: avm
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: avm-darwin-amd64
+            executable: avm
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: avm-darwin-arm64
+            executable: avm
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: avm-windows-amd64.exe
+            executable: avm.exe
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: avm-${{ matrix.goos }}-${{ matrix.goarch }}
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test release binary
+        shell: pwsh
+        run: |
+          $binary = Join-Path (Join-Path (Join-Path target '${{ matrix.target }}') release) '${{ matrix.executable }}'
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release binary smoke test failed with exit code $LASTEXITCODE"
+          }
+      - name: Name asset and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $source = Join-Path (Join-Path (Join-Path target '${{ matrix.target }}') release) '${{ matrix.executable }}'
+          $destination = Join-Path dist '${{ matrix.asset }}'
+          Copy-Item -LiteralPath $source -Destination $destination
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+          "$digest  ${{ matrix.asset }}" | Set-Content -NoNewline -Encoding utf8 (Join-Path dist '${{ matrix.asset }}.sha256')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
 
-  create-release:
-    runs-on: ubuntu-latest
+  publish:
+    name: Publish GitHub release
     needs: build
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: release-assets
-
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v1
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
