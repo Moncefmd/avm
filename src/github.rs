@@ -9,52 +9,20 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue, LINK, RETRY_AFTER, USER_AGENT,
 };
-use semver::Version;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::error::{AvmError, Result};
+use crate::release::{Asset, MAX_BINARY_BYTES, Release};
 use crate::version;
 
 pub const DEFAULT_API_URL: &str = "https://api.github.com/repos/argoproj/argo-cd/releases";
-pub const MAX_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_API_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
 const API_VERSION: &str = "2022-11-28";
 const MAX_RETRIES: usize = 3;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Release {
-    pub tag_name: String,
-    #[serde(default)]
-    pub draft: bool,
-    #[serde(default)]
-    pub prerelease: bool,
-    #[serde(default)]
-    pub assets: Vec<Asset>,
-}
-
-impl Release {
-    pub fn parsed_version(&self) -> Option<Version> {
-        version::parse_tag(&self.tag_name)
-    }
-
-    pub fn asset(&self, name: &str) -> Option<&Asset> {
-        self.assets.iter().find(|asset| asset.name == name)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Asset {
-    pub name: String,
-    pub browser_download_url: String,
-    #[serde(default)]
-    pub digest: Option<String>,
-    #[serde(default)]
-    pub size: Option<u64>,
-}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Download {
@@ -74,10 +42,12 @@ impl GitHubClient {
     pub fn from_env() -> Result<Self> {
         let api_url =
             std::env::var("AVM_GITHUB_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_owned());
-        let token = std::env::var("AVM_GITHUB_TOKEN")
-            .ok()
-            .or_else(|| std::env::var("GH_TOKEN").ok())
-            .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+        let token = select_token(
+            &api_url,
+            std::env::var("AVM_GITHUB_TOKEN").ok(),
+            std::env::var("GH_TOKEN").ok(),
+            std::env::var("GITHUB_TOKEN").ok(),
+        );
         Self::new(api_url, token.as_deref())
     }
 
@@ -154,7 +124,19 @@ impl GitHubClient {
 
     fn get_release(&self, url: &str, label: &str) -> Result<Release> {
         match self.send_api_get(url) {
-            Ok(response) => decode_json(response),
+            Ok(response) => {
+                let mut release: Release = decode_json(response)?;
+                match version::normalize(&release.tag_name) {
+                    Ok(returned) if returned == label => {
+                        release.tag_name = returned;
+                        Ok(release)
+                    }
+                    _ => Err(AvmError::ReleaseTagMismatch {
+                        requested: label.to_owned(),
+                        returned: release.tag_name,
+                    }),
+                }
+            }
             Err(AvmError::Api { status: 404, .. }) => {
                 Err(AvmError::ReleaseNotFound(label.to_owned()))
             }
@@ -325,6 +307,19 @@ impl GitHubClient {
         }
         self.send_get(&self.api, url)
     }
+}
+
+fn select_token(
+    api_url: &str,
+    explicit: Option<String>,
+    gh_token: Option<String>,
+    github_token: Option<String>,
+) -> Option<String> {
+    explicit.or_else(|| {
+        (api_url.trim_end_matches('/') == DEFAULT_API_URL)
+            .then(|| gh_token.or(github_token))
+            .flatten()
+    })
 }
 
 fn api_redirect_policy(origin: Url) -> reqwest::redirect::Policy {
@@ -597,6 +592,73 @@ mod tests {
             sanitized_url("https://user:secret@example.test/file?token=secret#fragment"),
             "https://example.test/file"
         );
+    }
+
+    #[test]
+    fn ambient_tokens_are_scoped_to_the_default_api() {
+        let custom = "https://mirror.example.test/releases";
+        assert_eq!(
+            select_token(
+                custom,
+                None,
+                Some("gh-secret".to_owned()),
+                Some("actions-secret".to_owned())
+            ),
+            None
+        );
+        assert_eq!(
+            select_token(
+                custom,
+                Some("mirror-secret".to_owned()),
+                Some("gh-secret".to_owned()),
+                None
+            )
+            .as_deref(),
+            Some("mirror-secret")
+        );
+        assert_eq!(
+            select_token(
+                &format!("{DEFAULT_API_URL}/"),
+                None,
+                Some("gh-secret".to_owned()),
+                Some("actions-secret".to_owned())
+            )
+            .as_deref(),
+            Some("gh-secret")
+        );
+    }
+
+    #[test]
+    fn rejects_a_mismatched_exact_release_response() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"tag_name":"v9.9.9"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let client = GitHubClient::new(format!("http://{address}/releases"), None).unwrap();
+        let error = client.release("v1.2.3").unwrap_err();
+        assert!(matches!(
+            error,
+            AvmError::ReleaseTagMismatch {
+                requested,
+                returned
+            } if requested == "v1.2.3" && returned == "v9.9.9"
+        ));
+        server.join().unwrap();
     }
 
     #[test]

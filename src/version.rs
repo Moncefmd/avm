@@ -77,6 +77,7 @@ pub fn parse_tag(tag: &str) -> Option<Version> {
     Version::parse(raw).ok()
 }
 
+#[cfg(test)]
 pub fn sort_tags_desc(tags: &mut [String]) {
     tags.sort_by(|a, b| match (parse_tag(a), parse_tag(b)) {
         (Some(a), Some(b)) => b.cmp(&a),

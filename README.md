@@ -88,7 +88,8 @@ avm setup --shell fish
 avm setup --shell powershell
 ```
 
-On Bash, Zsh, and Fish, AVM maintains one marked profile block. On Windows, PowerShell setup
+On Bash, AVM maintains marked blocks in both `.bashrc` and the active login profile so login and
+non-login shells work. Zsh and Fish receive one marked profile block. On Windows, PowerShell setup
 updates the per-user PATH.
 
 ## Selecting a version
@@ -271,18 +272,19 @@ environment variables are recognized:
 | --- | --- |
 | `AVM_HOME` | Override the default `~/.avm` data directory. |
 | `AVM_ARGOCD_VERSION` | Select one exact version for the current process and its children. |
-| `AVM_GITHUB_TOKEN` | Optional GitHub token for higher API rate limits. |
-| `GH_TOKEN` | Token fallback after `AVM_GITHUB_TOKEN`. |
-| `GITHUB_TOKEN` | Final token fallback, useful in GitHub Actions. |
+| `AVM_GITHUB_TOKEN` | Explicit token for the configured releases API endpoint. |
+| `GH_TOKEN` | Token fallback for the built-in GitHub endpoint only. |
+| `GITHUB_TOKEN` | Final built-in-endpoint fallback, useful in GitHub Actions. |
 | `AVM_GITHUB_API_URL` | Override the Argo CD releases API endpoint for a mirror or test fixture. |
 
 Every management command also accepts the global `--avm-home <DIR>` option for a one-command
 override of `AVM_HOME`. When using a custom home persistently, run
 `avm --avm-home <DIR> setup` so the dispatcher from that home is the one configured in PATH.
 
-Tokens are sent only to same-origin GitHub API metadata requests. AVM rejects cross-origin API
-redirects and pagination links and uses a separate unauthenticated client for release-asset
-downloads.
+`GH_TOKEN` and `GITHUB_TOKEN` are never forwarded to an `AVM_GITHUB_API_URL` override; set
+`AVM_GITHUB_TOKEN` explicitly when a mirror requires authentication. Tokens are sent only to
+same-origin API metadata requests. AVM rejects cross-origin API redirects and pagination links and
+uses a separate unauthenticated client for release-asset downloads.
 
 ## Data layout
 

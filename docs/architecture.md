@@ -56,16 +56,22 @@ so persistent custom-home setups must configure that root's bin directory in PAT
 | --- | --- |
 | `cli` | Clap command and flag definitions. |
 | `app` | User-visible command orchestration and output. |
+| `catalog` | Release selection, stability policy, cache freshness, and stale-cache fallback. |
 | `version` | Strict selector parsing, normalization, and semantic ordering. |
+| `release` | Transport-independent release, asset, and binary-size domain values. |
 | `resolver` | Offline precedence, ancestor pin discovery, and atomic pin writes. |
 | `platform` | Rust host to exact Argo CD release-asset mapping. |
 | `github` | GitHub REST, pagination, bounded retries, downloads, and checksum parsing. |
+| `installer` | Verified download, staging, validation, and install transaction orchestration. |
+| `shell` | Shell detection, PATH setup plans, guarded profile edits, and Windows user PATH setup. |
 | `store` | Paths, locks, staging, atomic state, metadata, cache, and deletion safety. |
 | `shim` | Dispatch from the consistent `argocd` command to an upstream executable. |
 | `error` | Typed failures and stable exit categories. |
 
-Dependencies flow inward through values such as `Release`, `InstallMetadata`, and `Platform`
-instead of global mutable state. Tests can override the API endpoint and AVM home.
+The `release`, `version`, `platform`, and `error` modules are leaf domain boundaries. GitHub
+transport and persistent storage both depend on release values; storage never depends on the
+GitHub client. `app` coordinates catalog, shell, resolver, store, and transport services without
+global mutable state. Tests can override the API endpoint and AVM home.
 
 ## Selector model
 
@@ -90,10 +96,11 @@ dispatcher.
 5. Acquire the exclusive per-version lock.
 6. If a complete installation exists, hash its binary and require its metadata to agree.
 7. Stream the asset into a random staging directory under `versions/`, hashing as bytes arrive.
-8. Reject a mismatch before making the file executable or visible.
-9. Write and sync `install.json`.
-10. Rename the complete staging directory to its canonical version directory.
-11. If `--force` is replacing an installation, keep the installed directory as a same-filesystem
+8. Require a non-empty body whose streamed size matches published asset metadata when available.
+9. Reject a checksum mismatch before making the file executable or visible.
+10. Revalidate the staged executable at the storage boundary, then write and sync `install.json`.
+11. Rename the complete staging directory to its canonical version directory.
+12. If `--force` is replacing an installation, keep the installed directory as a same-filesystem
     backup until the new rename succeeds.
 
 `install` stops after this transaction. `default` atomically writes `state/default`; `pin`
@@ -171,8 +178,12 @@ prints profile-specific generation and dot-sourcing instructions.
 `setup` applies its changes idempotently by default. `--dry-run` reports the exact changes without
 writing. `--shell <shell>` overrides shell detection.
 
-- Bash, Zsh, and Fish profiles receive one marked AVM block through an atomic same-directory
-  replacement. Existing permissions and newline style are preserved.
+- Bash receives one marked AVM block in `.bashrc` and one in its first active login profile;
+  existing `.bash_profile`, `.bash_login`, or `.profile` precedence is preserved. The PATH command
+  is idempotent when a login profile already sources `.bashrc`.
+- Zsh and Fish receive one marked AVM block. All profile edits are preflighted before any file is
+  changed, then use atomic same-directory replacement. Existing permissions and newline style are
+  preserved.
 - Symlinked, non-regular, oversized, malformed-marker, BOM, and non-UTF-8 profiles are refused.
 - Windows PowerShell updates the per-user PATH without editing a PowerShell profile.
 - PowerShell on another platform reports a manual instruction when it cannot identify a safe
@@ -208,6 +219,8 @@ the pass before any report can be serialized.
 - A marked dispatcher is compared byte-for-byte with the running AVM executable before it is
   trusted.
 - API credentials are absent from the release-download client.
+- Ambient `GH_TOKEN` and `GITHUB_TOKEN` values authenticate only the built-in GitHub endpoint;
+  custom API endpoints require the explicit `AVM_GITHUB_TOKEN`.
 - Authenticated API requests cannot follow redirects or pagination links to another origin.
 - Non-loopback network URLs use HTTPS, including redirects.
 - Downloads have connection, total-time, redirect, retry, and one-GiB size limits.

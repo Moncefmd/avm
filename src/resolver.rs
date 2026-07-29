@@ -43,6 +43,7 @@ pub struct Resolution {
 }
 
 impl Resolution {
+    #[cfg(test)]
     pub fn explain(&self) -> String {
         format!("{} selected by {}", self.version, self.source)
     }

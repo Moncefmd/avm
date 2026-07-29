@@ -10,11 +10,10 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 use crate::error::{AvmError, Result};
-use crate::github::{MAX_BINARY_BYTES, Release};
 use crate::platform::Platform;
+use crate::release::{MAX_BINARY_BYTES, Release};
 use crate::version;
 
-pub const RELEASE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const METADATA_FILE: &str = "install.json";
@@ -350,6 +349,33 @@ impl Store {
         ensure_canonical_tag(version)?;
         if metadata.version != version {
             return Err(AvmError::UnsafePath(staging.path().to_path_buf()));
+        }
+        let staged_binary = staging.path().join(self.platform.binary_name());
+        let staged_metadata = match fs::symlink_metadata(&staged_binary) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AvmError::CorruptInstall(version.to_owned()));
+            }
+            Err(error) => {
+                return Err(AvmError::io(
+                    format!("inspect {}", staged_binary.display()),
+                    error,
+                ));
+            }
+        };
+        if is_link_like(&staged_metadata)
+            || !staged_metadata.file_type().is_file()
+            || staged_metadata.len() == 0
+            || staged_metadata.len() > MAX_BINARY_BYTES
+        {
+            return Err(AvmError::CorruptInstall(version.to_owned()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if staged_metadata.permissions().mode() & 0o111 == 0 {
+                return Err(AvmError::CorruptInstall(version.to_owned()));
+            }
         }
 
         write_json_file(&staging.path().join(METADATA_FILE), metadata)?;
@@ -1121,6 +1147,31 @@ mod tests {
         fs::write(&binary, b"unmanaged binary").unwrap();
         make_executable(&binary).unwrap();
         assert!(!store.is_installed("v3.4.5").unwrap());
+    }
+
+    #[test]
+    fn commit_rejects_an_empty_staged_binary() {
+        let (_temp, store) = test_store();
+        let staging = store.staging_dir().unwrap();
+        let binary = staging.path().join(store.platform.binary_name());
+        fs::write(&binary, []).unwrap();
+        make_executable(&binary).unwrap();
+        let metadata = InstallMetadata::new(
+            "v3.4.5".to_owned(),
+            store.platform.asset_name(),
+            "a".repeat(64),
+            true,
+            "https://example.invalid/argocd".to_owned(),
+        );
+
+        let error = store
+            .commit_install(&staging, "v3.4.5", &metadata, false)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AvmError::CorruptInstall(version) if version == "v3.4.5"
+        ));
+        assert!(!store.paths.versions.join("v3.4.5").exists());
     }
 
     #[test]

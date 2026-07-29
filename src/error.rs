@@ -21,6 +21,9 @@ pub enum AvmError {
     #[error("Argo CD release {0} was not found")]
     ReleaseNotFound(String),
 
+    #[error("release lookup for {requested} returned {returned}; refusing a mismatched exact tag")]
+    ReleaseTagMismatch { requested: String, returned: String },
+
     #[error("release {version} has no asset named {asset}")]
     AssetNotFound { version: String, asset: String },
 
@@ -55,6 +58,18 @@ pub enum AvmError {
 
     #[error("download exceeded the 1 GiB safety limit")]
     DownloadTooLarge,
+
+    #[error("downloaded asset {0} was empty")]
+    EmptyDownload(String),
+
+    #[error(
+        "downloaded asset {asset} had an unexpected size: expected {expected} bytes, received {actual}"
+    )]
+    DownloadSizeMismatch {
+        asset: String,
+        expected: u64,
+        actual: u64,
+    },
 
     #[error("GitHub API rate limit exhausted{reset}")]
     RateLimited { reset: String },
@@ -149,13 +164,16 @@ impl AvmError {
             | Self::Api { .. }
             | Self::RateLimited { .. }
             | Self::ReleaseNotFound(_)
+            | Self::ReleaseTagMismatch { .. }
             | Self::AssetNotFound { .. } => 3,
             Self::ChecksumMissing { .. }
             | Self::ChecksumConflict { .. }
             | Self::MalformedChecksum(_)
             | Self::ChecksumMismatch { .. }
             | Self::ChecksumChanged { .. }
-            | Self::DownloadTooLarge => 4,
+            | Self::DownloadTooLarge
+            | Self::EmptyDownload(_)
+            | Self::DownloadSizeMismatch { .. } => 4,
             _ => 5,
         }
     }

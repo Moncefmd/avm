@@ -1,12 +1,16 @@
-pub mod app;
-pub mod cli;
-pub mod error;
-pub mod github;
+mod app;
+mod catalog;
+mod cli;
+mod error;
+mod github;
+mod installer;
 pub mod platform;
-pub mod resolver;
+mod release;
+mod resolver;
+mod shell;
 pub mod shim;
-pub mod store;
-pub mod version;
+mod store;
+mod version;
 
 pub use app::{AppOutcome, run};
 pub use cli::Cli;

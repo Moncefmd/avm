@@ -151,6 +151,9 @@ fn setup_applies_idempotently() {
     let profile = std::fs::read_to_string(profile_home.join(".bashrc")).unwrap();
     assert_eq!(profile.matches("# >>> avm setup >>>").count(), 1);
     assert_eq!(profile.matches("# <<< avm setup <<<").count(), 1);
+    let login_profile = std::fs::read_to_string(profile_home.join(".bash_profile")).unwrap();
+    assert_eq!(login_profile.matches("# >>> avm setup >>>").count(), 1);
+    assert_eq!(login_profile.matches("# <<< avm setup <<<").count(), 1);
 }
 
 #[test]
@@ -220,6 +223,54 @@ fn rejects_checksum_mismatch_without_committing_an_install() {
         .failure()
         .code(4)
         .stderr(predicate::str::contains("checksum mismatch"));
+
+    server.join().unwrap();
+    assert!(!home.join("versions/v1.2.3").exists());
+}
+
+#[test]
+fn rejects_an_empty_asset_without_committing_an_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let platform = avm::platform::Platform::current().unwrap();
+    let empty = Vec::new();
+    let digest = hex_sha256(&empty);
+    let (api_url, server) = release_server(&platform.asset_name(), empty, &digest);
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["install", "v1.2.3"])
+        .assert()
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("was empty"));
+
+    server.join().unwrap();
+    assert!(!home.join("versions/v1.2.3").exists());
+}
+
+#[test]
+fn rejects_an_asset_whose_streamed_size_disagrees_with_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let platform = avm::platform::Platform::current().unwrap();
+    let binary = fixture_binary();
+    let digest = hex_sha256(&binary);
+    let advertised_size = binary.len() as u64 + 1;
+    let (api_url, server) =
+        release_server_with_size(&platform.asset_name(), binary, &digest, advertised_size);
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["install", "v1.2.3"])
+        .assert()
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("unexpected size"));
 
     server.join().unwrap();
     assert!(!home.join("versions/v1.2.3").exists());
@@ -322,6 +373,64 @@ fn major_and_minor_selectors_choose_the_newest_stable_release() {
     minor_server.join().unwrap();
     assert!(minor_home.join("versions/v1.2.4").is_dir());
     assert!(!minor_home.join("versions/v1.2.5-rc1").exists());
+}
+
+#[test]
+fn stable_filter_uses_semver_and_api_prerelease_signals() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let platform = avm::platform::Platform::current().unwrap();
+    let binary = fixture_binary();
+    let digest = hex_sha256(&binary);
+    let (api_url, server) = release_list_server(&platform.asset_name(), binary, &digest, 2);
+
+    let stable_output = avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["available", "stable", "--prerelease", "--json"])
+        .output()
+        .unwrap();
+    assert!(stable_output.status.success());
+    let stable: serde_json::Value = serde_json::from_slice(&stable_output.stdout).unwrap();
+    let stable_tags = stable["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|release| release["tag_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!stable_tags.contains(&"v1.2.5-rc1"));
+    assert!(!stable_tags.contains(&"v1.2.6"));
+
+    let all_output = avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["available", "1.2", "--prerelease", "--refresh", "--json"])
+        .output()
+        .unwrap();
+    assert!(all_output.status.success());
+    let all: serde_json::Value = serde_json::from_slice(&all_output.stdout).unwrap();
+    let all_tags = all["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|release| release["tag_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(all_tags.contains(&"v1.2.5-rc1"));
+    assert!(all_tags.contains(&"v1.2.6"));
+
+    server.join().unwrap();
+
+    let (api_url, exact_server) = single_release_server("v1.2.5-rc1");
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["info", "v1.2.5-rc1"])
+        .assert()
+        .success();
+    exact_server.join().unwrap();
 }
 
 #[test]
@@ -659,6 +768,65 @@ fn available_and_info_emit_versioned_json() {
     assert_eq!(report["schema"], 1);
     assert_eq!(report["selector"], "v1.2.3");
     assert_eq!(report["release"]["tag_name"], "v1.2.3");
+}
+
+#[test]
+fn custom_api_tokens_require_explicit_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+
+    let (api_url, ambient_server) = single_release_server("v1.2.3");
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .env("GITHUB_TOKEN", "ambient-sentinel")
+        .args(["info", "v1.2.3"])
+        .assert()
+        .success();
+    let ambient_request = ambient_server.join().unwrap().to_ascii_lowercase();
+    assert!(
+        !ambient_request.contains("authorization:"),
+        "custom endpoints must not receive ambient GitHub credentials: {ambient_request}"
+    );
+
+    let (api_url, explicit_server) = single_release_server("v1.2.3");
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .env("AVM_GITHUB_TOKEN", "explicit-sentinel")
+        .args(["info", "v1.2.3"])
+        .assert()
+        .success();
+    let explicit_request = explicit_server.join().unwrap().to_ascii_lowercase();
+    assert!(
+        explicit_request.contains("authorization: bearer explicit-sentinel"),
+        "an explicit custom-endpoint token should be sent: {explicit_request}"
+    );
+}
+
+#[test]
+fn exact_selector_rejects_a_mismatched_release_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let (api_url, server) = single_release_server("v9.9.9");
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("AVM_GITHUB_API_URL", &api_url)
+        .args(["info", "v1.2.3"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "lookup for v1.2.3 returned v9.9.9",
+        ));
+
+    server.join().unwrap();
+    assert!(!home.join("versions/v1.2.3").exists());
+    assert!(!home.join("versions/v9.9.9").exists());
 }
 
 #[test]
@@ -1122,6 +1290,16 @@ fn release_server(
     binary: Vec<u8>,
     digest: &str,
 ) -> (String, thread::JoinHandle<()>) {
+    let advertised_size = binary.len() as u64;
+    release_server_with_size(asset_name, binary, digest, advertised_size)
+}
+
+fn release_server_with_size(
+    asset_name: &str,
+    binary: Vec<u8>,
+    digest: &str,
+    advertised_size: u64,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let base = format!("http://{address}");
@@ -1151,7 +1329,7 @@ fn release_server(
                         "name": asset_name,
                         "browser_download_url": asset_url,
                         "digest": format!("sha256:{digest}"),
-                        "size": binary.len()
+                        "size": advertised_size
                     }]
                 })
                 .to_string();
@@ -1162,6 +1340,31 @@ fn release_server(
                 write_response(&mut stream, "404 Not Found", "text/plain", b"missing");
             }
         }
+    });
+
+    (api_url, server)
+}
+
+fn single_release_server(response_tag: &str) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let api_url = format!("http://{address}/releases");
+    let response_tag = response_tag.to_owned();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let read = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..read]).into_owned();
+        let body = serde_json::json!({
+            "tag_name": response_tag,
+            "draft": false,
+            "prerelease": false,
+            "assets": []
+        })
+        .to_string();
+        write_response(&mut stream, "200 OK", "application/json", body.as_bytes());
+        request
     });
 
     (api_url, server)
@@ -1241,7 +1444,11 @@ fn release_list_server(
                 };
                 let body = serde_json::json!([
                     release("v1.2.3", false),
-                    release("v1.2.5-rc1", true),
+                    // The API flag is intentionally inconsistent: stable resolution must also
+                    // derive prerelease status from the semantic version.
+                    release("v1.2.5-rc1", false),
+                    // The inverse inconsistency is also excluded from stable resolution.
+                    release("v1.2.6", true),
                     release("v1.3.0", false),
                     release("v1.2.4", false),
                     release("v11.2.0", false)
