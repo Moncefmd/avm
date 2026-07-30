@@ -29,7 +29,7 @@ fn avm_process() -> std::process::Command {
 }
 
 #[test]
-fn reports_help_version_and_the_v01_command_surface() {
+fn reports_help_version_and_the_v1_command_surface() {
     avm()
         .assert()
         .success()
@@ -48,7 +48,7 @@ fn reports_help_version_and_the_v01_command_surface() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("avm 0.1.0"));
+        .stdout(predicate::str::contains("avm 1.0.0"));
 
     avm()
         .args(["completion", "powershell"])
