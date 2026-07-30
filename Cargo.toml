@@ -1,0 +1,41 @@
+[package]
+name = "avm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+authors = ["Moncefmd"]
+description = "A fast, safe version manager for the Argo CD CLI"
+license = "Apache-2.0"
+repository = "https://github.com/Moncefmd/avm"
+readme = "README.md"
+keywords = ["argocd", "version-manager", "cli", "gitops"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+directories = "6"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "system-proxy"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3.27"
+thiserror = "2"
+url = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

@@ -2,52 +2,72 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
+  verify:
+    name: Verify tag and source
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Go
-        uses: actions/setup-go@v3
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          go-version: '1.24.3'
-
-      - name: Build binaries
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - name: Match Cargo version to tag
+        shell: bash
         run: |
-          cd avm
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o ../avm-${{ matrix.goos }}-${{ matrix.goarch }}
-        env:
-          CGO_ENABLED: 0
+          manifest_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "avm") | .version')"
+          test "v${manifest_version}" = "${GITHUB_REF_NAME}"
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: avm-${{ matrix.goos }}-${{ matrix.goarch }}
+  build:
+    name: Build release artifacts
+    needs: verify
+    uses: ./.github/workflows/release-build.yml
+    with:
+      upload_artifacts: true
 
-  create-release:
-    runs-on: ubuntu-latest
+  publish:
+    name: Publish GitHub release
     needs: build
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: release-assets
-
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v1
+          path: dist
+          merge-multiple: true
+      - name: Verify release artifact set
+        shell: bash
+        run: |
+          expected=(
+            avm-linux-amd64
+            avm-linux-arm64
+            avm-darwin-amd64
+            avm-darwin-arm64
+            avm-windows-amd64.exe
+          )
+          for asset in "${expected[@]}"; do
+            test -f "dist/${asset}"
+            test -f "dist/${asset}.sha256"
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 10
+          cd dist
+          sha256sum --check --strict ./*.sha256
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: release-assets/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
