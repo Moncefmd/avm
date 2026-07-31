@@ -26,6 +26,27 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Validate installer templates
+        shell: pwsh
+        run: |
+          bash -n scripts/install.sh.in
+          if ($LASTEXITCODE -ne 0) {
+            throw 'install.sh.in failed bash syntax validation'
+          }
+          shellcheck scripts/install.sh.in
+          if ($LASTEXITCODE -ne 0) {
+            throw 'install.sh.in failed ShellCheck'
+          }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/install.ps1.in'),
+            [ref] $tokens,
+            [ref] $errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            throw ($errors | ForEach-Object Message | Out-String)
+          }
 
   test:
     name: Test (${{ matrix.os }})

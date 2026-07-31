@@ -35,6 +35,9 @@ fn reports_help_version_and_the_v1_command_surface() {
         .success()
         .stdout(predicate::str::contains("Usage: avm"))
         .stdout(predicate::str::contains("install"))
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("uninit"))
+        .stdout(predicate::str::contains("__dispatch-v1").not())
         .stdout(predicate::str::contains("available"))
         .stdout(predicate::str::contains("exec"));
 
@@ -45,17 +48,89 @@ fn reports_help_version_and_the_v1_command_surface() {
         .stdout(predicate::str::contains("install [OPTIONS] [SELECTOR]"));
 
     avm()
+        .args(["help", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("managed `argocd` dispatcher"))
+        .stdout(predicate::str::contains(
+            "configures that directory in PATH",
+        ))
+        .stdout(predicate::str::contains("installs AVM tab completion"))
+        .stdout(predicate::str::contains("does not download or select"))
+        .stdout(predicate::str::contains("an Argo CD CLI version"));
+
+    avm()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("avm 1.0.0"));
+        .stdout(predicate::str::contains(format!(
+            "avm {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 
     avm()
         .args(["completion", "powershell"])
         .env("AVM_GITHUB_API_URL", "http://127.0.0.1:1/releases")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Register-ArgumentCompleter"));
+        .stdout(predicate::str::contains("Register-ArgumentCompleter"))
+        .stdout(predicate::str::contains("Invoke-Expression").not());
+
+    avm()
+        .env("COMPLETE", "powershell")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Register-ArgumentCompleter"))
+        .stdout(predicate::str::contains("Invoke-Expression").not());
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_tab_completion_is_dynamic_and_does_not_evaluate_typed_input() {
+    const SCRIPT: &str = r#"
+$avmExecutable = $env:AVM_TEST_EXE
+$target = Split-Path -Parent $avmExecutable
+$env:PATH = "$target;$env:PATH"
+$registration = & $avmExecutable completion powershell | Out-String
+if ($registration -match 'Invoke-Expression|\biex\b') { throw 'unsafe evaluator remains' }
+& ([scriptblock]::Create($registration))
+
+$root = TabExpansion2 'avm i' 5
+if ('init' -notin @($root.CompletionMatches.CompletionText)) { throw 'root completion failed' }
+$stable = TabExpansion2 'avm install s' 13
+if ('stable' -notin @($stable.CompletionMatches.CompletionText)) { throw 'dynamic version completion failed' }
+$blank = TabExpansion2 'avm install ' 12
+if ('stable' -notin @($blank.CompletionMatches.CompletionText) -or '--force' -notin @($blank.CompletionMatches.CompletionText)) {
+    throw 'empty argument completion failed'
+}
+
+$global:AvmCompletionProbe = 'safe'
+$env:COMPLETE = 'sentinel'
+$attack = 'avm --avm-home "$($global:AvmCompletionProbe = ''executed'')" i'
+$attackResult = TabExpansion2 $attack $attack.Length
+if ($global:AvmCompletionProbe -ne 'safe') { throw 'typed input executed' }
+if ('init' -notin @($attackResult.CompletionMatches.CompletionText)) { throw 'expression text broke completion' }
+if ($env:COMPLETE -ne 'sentinel') { throw 'COMPLETE was not restored' }
+"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("AVM_TEST_EXE", env!("CARGO_BIN_EXE_avm"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "PowerShell completion smoke failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -108,18 +183,23 @@ fn empty_store_and_path_traversal_are_safe() {
 }
 
 #[test]
-fn setup_dry_run_is_read_only() {
+fn init_dry_run_is_read_only() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("missing-avm-home");
 
     avm()
         .arg("--avm-home")
         .arg(&home)
-        .args(["setup", "--shell", "bash", "--dry-run"])
+        .args(["init", "--shell", "bash", "--no-completion", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("AVM setup preview for bash"))
-        .stdout(predicate::str::contains("avm setup --shell bash"));
+        .stdout(predicate::str::contains(
+            "AVM initialization preview for bash",
+        ))
+        .stdout(predicate::str::contains("Managed argocd command"))
+        .stdout(predicate::str::contains(
+            "avm init --shell bash --no-completion",
+        ));
 
     assert!(
         !home.exists(),
@@ -129,31 +209,200 @@ fn setup_dry_run_is_read_only() {
 
 #[cfg(unix)]
 #[test]
-fn setup_applies_idempotently() {
+fn init_migrates_setup_and_applies_dispatcher_and_completion_idempotently() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join(".avm");
     let profile_home = temp.path().join("profile-home");
     std::fs::create_dir(&profile_home).unwrap();
+    std::fs::write(
+        profile_home.join(".bashrc"),
+        "# before\n# >>> avm setup >>>\nold path command\n# <<< avm setup <<<\n",
+    )
+    .unwrap();
 
     for _ in 0..2 {
         avm()
             .arg("--avm-home")
             .arg(&home)
             .env("HOME", &profile_home)
-            .args(["setup", "--shell", "bash"])
+            .args(["init", "--shell", "bash"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("Configured bash"));
+            .stdout(predicate::str::contains("Initialized AVM for bash"))
+            .stdout(predicate::str::contains(
+                "did not install or change an Argo CD version selection",
+            ));
     }
 
     let platform = avm::platform::Platform::current().unwrap();
     assert!(home.join("bin").join(platform.binary_name()).is_file());
     let profile = std::fs::read_to_string(profile_home.join(".bashrc")).unwrap();
-    assert_eq!(profile.matches("# >>> avm setup >>>").count(), 1);
-    assert_eq!(profile.matches("# <<< avm setup <<<").count(), 1);
+    assert!(profile.starts_with("# before\n"));
+    assert!(!profile.contains("avm setup"));
+    assert_eq!(profile.matches("# >>> avm init >>>").count(), 1);
+    assert_eq!(profile.matches("# <<< avm init <<<").count(), 1);
+    assert_eq!(profile.matches("# >>> avm completion >>>").count(), 1);
+    assert_eq!(profile.matches("# <<< avm completion <<<").count(), 1);
     let login_profile = std::fs::read_to_string(profile_home.join(".bash_profile")).unwrap();
-    assert_eq!(login_profile.matches("# >>> avm setup >>>").count(), 1);
-    assert_eq!(login_profile.matches("# <<< avm setup <<<").count(), 1);
+    assert_eq!(login_profile.matches("# >>> avm init >>>").count(), 1);
+    assert_eq!(login_profile.matches("# <<< avm init <<<").count(), 1);
+    assert!(!login_profile.contains("avm completion"));
+
+    let completion = profile_home.join(".local/share/bash-completion/completions/avm");
+    assert!(completion.is_file());
+    assert!(
+        std::fs::read_to_string(completion)
+            .unwrap()
+            .contains("Generated by AVM")
+    );
+    assert!(!home.join("state/default").exists());
+    assert_eq!(
+        std::fs::read_dir(home.join("versions")).unwrap().count(),
+        0,
+        "init must not install an Argo CD version"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn uninit_reverses_owned_shell_integration_and_preserves_avm_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let profile_home = temp.path().join("profile-home");
+    std::fs::create_dir(&profile_home).unwrap();
+    std::fs::write(profile_home.join(".bashrc"), "# user line\n").unwrap();
+    install_shell_fixture_without_default(&home);
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .args(["init", "--shell", "bash"])
+        .assert()
+        .success();
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .env("AVM_GITHUB_API_URL", "http://127.0.0.1:1/releases")
+        .args(["default", "v1.2.3"])
+        .assert()
+        .success();
+
+    let dispatcher = home
+        .join("bin")
+        .join(avm::platform::Platform::current().unwrap().binary_name());
+    let completion = profile_home.join(".local/share/bash-completion/completions/avm");
+    let before = std::fs::read(profile_home.join(".bashrc")).unwrap();
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .args(["uninit", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleanup preview"))
+        .stdout(predicate::str::contains("No files were changed"));
+    assert_eq!(std::fs::read(profile_home.join(".bashrc")).unwrap(), before);
+    assert!(dispatcher.exists());
+    assert!(completion.exists());
+
+    for _ in 0..2 {
+        avm()
+            .arg("--avm-home")
+            .arg(&home)
+            .env("HOME", &profile_home)
+            .args(["uninit"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Installed Argo CD versions, selections, and cache were preserved",
+            ));
+    }
+
+    let profile = std::fs::read_to_string(profile_home.join(".bashrc")).unwrap();
+    assert_eq!(profile, "# user line\n");
+    assert!(!dispatcher.exists());
+    assert!(!home.join("state/dispatcher.json").exists());
+    assert!(!completion.exists());
+    assert_eq!(
+        std::fs::read_to_string(home.join("state/default")).unwrap(),
+        "v1.2.3\n"
+    );
+    assert!(
+        !home
+            .join("bin")
+            .join(avm::platform::Platform::current().unwrap().binary_name())
+            .exists(),
+        "setting a default must not initialize shell integration"
+    );
+    assert!(home.join("versions/v1.2.3").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn uninit_preserves_a_damaged_dispatcher_but_cleans_independent_integration() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join(".avm");
+    let profile_home = temp.path().join("profile-home");
+    std::fs::create_dir(&profile_home).unwrap();
+    std::fs::write(profile_home.join(".bashrc"), "# user line\n").unwrap();
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .args(["init", "--shell", "bash"])
+        .assert()
+        .success();
+
+    let dispatcher = home
+        .join("bin")
+        .join(avm::platform::Platform::current().unwrap().binary_name());
+    let marker = home.join("state/dispatcher.json");
+    let completion = profile_home.join(".local/share/bash-completion/completions/avm");
+    std::fs::write(&dispatcher, b"damaged dispatcher").unwrap();
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .args(["uninit", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dispatcher launcher: preserve"))
+        .stdout(predicate::str::contains("No files were changed"));
+    assert!(completion.exists());
+
+    avm()
+        .arg("--avm-home")
+        .arg(&home)
+        .env("HOME", &profile_home)
+        .arg("uninit")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Shell profiles updated:"))
+        .stderr(predicate::str::contains(
+            "warning: preserved dispatcher artifacts",
+        ));
+
+    assert_eq!(
+        std::fs::read_to_string(profile_home.join(".bashrc")).unwrap(),
+        "# user line\n"
+    );
+    assert!(!completion.exists());
+    assert_eq!(std::fs::read(&dispatcher).unwrap(), b"damaged dispatcher");
+    assert!(marker.exists());
+}
+
+#[test]
+fn completion_dry_run_requires_install() {
+    avm()
+        .args(["completion", "bash", "--dry-run"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("--install"));
 }
 
 #[test]
@@ -497,6 +746,13 @@ fn pin_exact_local_selection_works_offline_and_can_be_unset() {
     let pin = project.join(".argocd-version");
     assert_eq!(std::fs::read_to_string(&pin).unwrap(), "v1.2.3\n");
     assert!(!home.join("state/default").exists());
+    assert!(
+        !home
+            .join("bin")
+            .join(avm::platform::Platform::current().unwrap().binary_name())
+            .exists(),
+        "pinning must not initialize shell integration"
+    );
 
     avm()
         .current_dir(&project)
@@ -552,12 +808,13 @@ fn exec_forwards_arguments_and_child_exit_code() {
 }
 
 #[test]
-fn managed_dispatcher_resolves_locally_forwards_arguments_and_writes_nothing() {
+fn managed_dispatcher_survives_avm_relocation_forwards_arguments_and_writes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join(".avm");
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     install_shell_fixture_without_default(&home);
+    install_dispatcher_fixture(&home);
 
     avm()
         .current_dir(&project)
@@ -574,10 +831,18 @@ fn managed_dispatcher_resolves_locally_forwards_arguments_and_writes_nothing() {
     let state_before = directory_entry_names(&home.join("state"));
     let locks_before = directory_entry_names(&home.join("locks"));
     let cache_before = directory_entry_names(&home.join("cache"));
+    let upgraded_prefix = temp.path().join("package-manager-bin");
+    std::fs::create_dir(&upgraded_prefix).unwrap();
+    let avm_name = platform.avm_binary_name();
+    let relocated_avm = upgraded_prefix.join(&avm_name);
+    std::fs::copy(home.join("bin").join(&avm_name), &relocated_avm).unwrap();
+    make_executable_for_test(&relocated_avm);
+    std::fs::remove_file(home.join("bin").join(&avm_name)).unwrap();
 
     let mut command = assert_cmd::Command::new(&dispatcher);
     command
         .current_dir(&project)
+        .env("PATH", path_with_prefix(&upgraded_prefix))
         .env("AVM_GITHUB_API_URL", "http://127.0.0.1:1/releases")
         .env_remove("AVM_GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
@@ -620,6 +885,7 @@ fn uninstall_waits_for_a_running_dispatcher_before_removing_its_version() {
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     install_shell_fixture_without_default(&home);
+    install_dispatcher_fixture(&home);
 
     avm()
         .current_dir(&project)
@@ -914,6 +1180,7 @@ fn doctor_audits_project_and_default_independently() {
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     install_shell_fixture_without_default(&home);
+    install_dispatcher_fixture(&home);
 
     avm()
         .current_dir(&project)
@@ -1123,8 +1390,17 @@ fn dynamic_completion_uses_the_command_surface_and_local_candidates() {
         1,
     );
     let commands = completion_values(&top_level);
+    assert!(
+        commands.iter().all(|value| value != "setup"),
+        "the retired setup command must not remain in completion: {commands:?}"
+    );
+    assert!(
+        commands.iter().all(|value| value != "__dispatch-v1"),
+        "the private dispatcher protocol must not be completed: {commands:?}"
+    );
     for expected in [
-        "setup",
+        "init",
+        "uninit",
         "install",
         "default",
         "pin",
@@ -1226,6 +1502,28 @@ fn install_shell_fixture_without_default(home: &Path) {
     assert!(!home.join("state/default").exists());
 }
 
+fn install_dispatcher_fixture(home: &Path) {
+    let platform = avm::platform::Platform::current().unwrap();
+    let avm_source = Path::new(env!("CARGO_BIN_EXE_avm"));
+    let bytes = std::fs::read(avm_source).unwrap();
+    let digest = hex_sha256(&bytes);
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let installed_avm = bin.join(platform.avm_binary_name());
+    let dispatcher = bin.join(platform.binary_name());
+    std::fs::write(&installed_avm, &bytes).unwrap();
+    std::fs::write(&dispatcher, &bytes).unwrap();
+    make_executable_for_test(&installed_avm);
+    make_executable_for_test(&dispatcher);
+    std::fs::write(
+        home.join("state/dispatcher.json"),
+        format!(
+            "{{\n  \"schema\": 2,\n  \"protocol\": 1,\n  \"launcher_sha256\": \"{digest}\",\n  \"avm_version\": \"\",\n  \"pending\": false\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
 fn fixture_binary() -> Vec<u8> {
     std::fs::read(fixture_executable()).unwrap()
 }
@@ -1251,7 +1549,11 @@ fn make_executable_for_test(path: &Path) {
 }
 
 fn path_with_avm_bin(home: &Path) -> OsString {
-    let mut entries = vec![home.join("bin")];
+    path_with_prefix(&home.join("bin"))
+}
+
+fn path_with_prefix(prefix: &Path) -> OsString {
+    let mut entries = vec![prefix.to_path_buf()];
     if let Some(path) = std::env::var_os("PATH") {
         entries.extend(std::env::split_paths(&path));
     }

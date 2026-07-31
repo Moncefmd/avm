@@ -2,19 +2,22 @@
 
 AVM is one Rust package with a library and a thin executable. The library owns version parsing,
 release discovery, filesystem transactions, selection, and command orchestration. `main.rs`
-chooses CLI mode or `argocd` dispatcher mode and maps typed errors to exit codes.
+chooses CLI mode or protocol-stable `argocd` launcher mode and maps typed errors to exit codes.
 
 ## Product model
 
-AVM separates three actions that should never be surprising:
+AVM separates five actions that should never be surprising:
 
 1. **Install** makes a release available locally, with verification required by default.
-2. **Select** writes either a personal default or an exact project pin.
-3. **Execute** resolves a selected installed release and runs it.
+2. **Initialize** creates explicitly requested shell integration.
+3. **Select** writes either a personal default or an exact project pin.
+4. **Execute** resolves a selected installed release and runs it.
+5. **Uninitialize** removes owned shell integration while preserving versions and selection.
 
 `avm install` performs only the first action. `avm default` and `avm pin` may install before
-persisting their selection. `avm exec` may install its required explicit selector but never mutates
-a persisted selection. The ordinary `argocd` dispatcher is entirely local and read-only.
+persisting their selection, but never initialize shell integration. `avm exec` may install its
+required explicit selector but never mutates a persisted selection. The ordinary `argocd`
+dispatcher is entirely local and read-only.
 
 Because `default <selector>` and `pin <selector>` can install, they expose the same `--force` and
 `--allow-unverified` controls as `install`; neither flag is valid with `--unset`. `exec` exposes
@@ -29,16 +32,21 @@ installation.
 
 ~/.avm/
 ├── bin/
-│   └── argocd[.exe]              # copy of AVM acting as a dispatcher
+│   ├── avm[.exe]                 # optional release-installer destination
+│   ├── avm[.exe].sha256          # release-installer ownership and digest marker
+│   └── argocd[.exe]              # protocol-v1 launcher
 ├── versions/
 │   └── v3.4.5/
 │       ├── argocd[.exe]          # upstream release binary
 │       └── install.json          # asset, digest, verification, and source
 ├── state/
 │   ├── default                   # canonical exact tag plus newline
-│   └── dispatcher.json           # proves AVM owns the dispatcher
+│   ├── dispatcher.json           # launcher protocol, digest, and ownership
+│   └── integration.json          # Windows user-PATH ownership receipt
 ├── cache/
 │   └── releases.json             # paginated GitHub release snapshot
+├── completions/
+│   └── avm.ps1                   # managed PowerShell registration script
 └── locks/
     ├── state.lock
     └── v3.4.5.lock
@@ -47,8 +55,14 @@ installation.
 Project pins live outside AVM home and contain one canonical tag plus a newline, for example
 `v3.4.5`. Every complete installation contains both its upstream executable and `install.json`.
 The default root is `~/.avm`; `AVM_HOME` or the global `--avm-home <DIR>` option selects another
-root for a management command. The dispatcher derives its root from its own `<root>/bin` location,
-so persistent custom-home setups must configure that root's bin directory in PATH.
+root for a management command. The launcher derives its root from its own `<root>/bin` location and
+passes that absolute root to the current AVM executable, so persistent custom-home setups must
+configure that root's bin directory in PATH.
+
+The release installers place AVM itself in that same bin directory, so initialization needs only
+one PATH entry for both `avm` and `argocd`. The adjacent SHA-256 marker belongs to the bootstrap
+installer, not the Argo CD version store; it proves that a future installer may replace the AVM
+executable without claiming ownership of an unrelated file.
 
 ## Module responsibilities
 
@@ -56,6 +70,7 @@ so persistent custom-home setups must configure that root's bin directory in PAT
 | --- | --- |
 | `cli` | Clap command and flag definitions. |
 | `app` | User-visible command orchestration and output. |
+| `atomic_file` | Guarded snapshots, concurrent-change detection, and atomic file replacement. |
 | `catalog` | Release selection, stability policy, cache freshness, and stale-cache fallback. |
 | `version` | Strict selector parsing, normalization, and semantic ordering. |
 | `release` | Transport-independent release, asset, and binary-size domain values. |
@@ -63,9 +78,13 @@ so persistent custom-home setups must configure that root's bin directory in PAT
 | `platform` | Rust host to exact Argo CD release-asset mapping. |
 | `github` | GitHub REST, pagination, bounded retries, downloads, and checksum parsing. |
 | `installer` | Verified download, staging, validation, and install transaction orchestration. |
-| `shell` | Shell detection, PATH setup plans, guarded profile edits, and Windows user PATH setup. |
+| `onboarding` | First-run orchestration across dispatcher, PATH, profiles, and completion. |
+| `launcher` | Stable `argocd`-to-current-AVM protocol delegation without a shell. |
+| `shell` | Shell detection, PATH integration plans, and Windows user PATH updates. |
+| `completion` | Dynamic registration generation and guarded per-shell installation. |
+| `profile` | Shared marked-block planning and atomic shell-profile edits. |
 | `store` | Paths, locks, staging, atomic state, metadata, cache, and deletion safety. |
-| `shim` | Dispatch from the consistent `argocd` command to an upstream executable. |
+| `shim` | Offline selection and dispatch from current AVM to an upstream executable. |
 | `error` | Typed failures and stable exit categories. |
 
 The `release`, `version`, `platform`, and `error` modules are leaf domain boundaries. GitHub
@@ -125,15 +144,25 @@ sources may name only exact releases.
 `avm exec <selector> -- <args>` is a separate explicit path. It resolves and prepares its required
 selector, then runs it without consulting or changing ambient selection.
 
-The dispatcher is a small copy of the AVM executable at `bin/argocd[.exe]`. When invoked with that
-filename, it:
+The dispatcher path contains a protocol-v1 launcher copied from AVM. The launcher behavior is
+deliberately frozen and version-independent even though the v1 implementation shares AVM's binary.
+When invoked as `argocd`, it:
 
 1. derives AVM home from its own `<root>/bin/argocd[.exe]` location;
-2. resolves environment, project, and default selection for the working directory;
-3. acquires a shared lock for the selected version;
-4. requires a complete installation with valid metadata and a regular, non-empty executable;
-5. spawns it with inherited arguments and standard streams; and
-6. waits and propagates the child's exit code while retaining the shared lock.
+2. resolves `avm[.exe]` in normal absolute PATH order, falls back to the adjacent
+   standalone-installer copy when it is not represented there, and rejects relative and empty PATH
+   entries;
+3. invokes the current AVM without a shell as
+   `avm --avm-home <root> __dispatch-v1 -- <original arguments>`;
+4. lets current AVM resolve environment, project, and default selection for the working directory;
+5. acquires a shared lock for the selected version;
+6. requires a complete installation with valid metadata and a regular, non-empty executable; and
+7. runs it with the original OS arguments and propagates the child's exit code while retaining the
+   shared lock.
+
+`__dispatch-v1` is a hidden compatibility protocol, not a user command. It remains available to old
+launchers when AVM is upgraded. A future purpose-built smaller launcher can use the same protocol
+without changing the package-manager lifecycle.
 
 Dispatcher execution never creates directories, downloads a release, repairs state, or changes a
 selection. A missing selected version produces an actionable error directing the user to
@@ -170,26 +199,81 @@ targeted live API request instead of this list cache.
 
 Generated shell registration calls AVM's local completion engine. Installed versions and cached
 release tags provide candidates. Completion never contacts GitHub. `completion <shell> --install`
-writes registration for Bash, Zsh, and Fish to their per-user completion directories; PowerShell
-prints profile-specific generation and dot-sourcing instructions.
+writes managed registration for Bash, Zsh, and Fish to their per-user completion directories and
+stores PowerShell registration under `AVM_HOME/completions`. It adds an idempotent activation block
+where the shell requires one. On Windows, both Windows PowerShell and PowerShell 7 current-user
+profiles are planned together. The PowerShell adapter parses command text into inert argument
+values and invokes AVM with an argument array; it never evaluates the typed command line.
+`--dry-run` preflights and reports the installation without writing.
 
-## Setup
+## Initialization
 
-`setup` applies its changes idempotently by default. `--dry-run` reports the exact changes without
-writing. `--shell <shell>` overrides shell detection.
+`init` creates or repairs the managed `argocd` dispatcher, configures its bin directory in PATH,
+and installs tab completion by default. It never installs an Argo CD release or changes the project
+pin or personal default. `--dry-run` previews the resulting configuration without writing,
+`--shell <shell>`
+overrides shell detection, and `--no-completion` limits the operation to dispatcher and PATH setup.
 
 - Bash receives one marked AVM block in `.bashrc` and one in its first active login profile;
   existing `.bash_profile`, `.bash_login`, or `.profile` precedence is preserved. The PATH command
-  is idempotent when a login profile already sources `.bashrc`.
-- Zsh and Fish receive one marked AVM block. All profile edits are preflighted before any file is
-  changed, then use atomic same-directory replacement. Existing permissions and newline style are
-  preserved.
-- Symlinked, non-regular, oversized, malformed-marker, BOM, and non-UTF-8 profiles are refused.
-- Windows PowerShell updates the per-user PATH without editing a PowerShell profile.
-- PowerShell on another platform reports a manual instruction when it cannot identify a safe
-  persistent target.
+  is idempotent when a login profile already sources `.bashrc`. Completion uses a separate marked
+  block in `.bashrc`.
+- Zsh receives separate PATH and completion blocks. Fish uses `config.fish` for PATH and its
+  conventional per-user completion directory. All completion destinations and profile edits are
+  preflighted before any file is changed; writes use atomic same-directory replacement. Existing
+  permissions and newline style are preserved.
+- Symlinked, non-regular, oversized, malformed-marker, and invalid-encoding profiles are refused.
+  POSIX shell profiles remain strict UTF-8 without a BOM. PowerShell profiles preserve existing
+  BOM-less UTF-8, UTF-8 BOM, UTF-16LE BOM, or UTF-16BE BOM encoding and newline style.
+- Windows PowerShell updates the per-user PATH and receives guarded completion blocks in the
+  current-user profiles for both Windows PowerShell and PowerShell 7. Other platforms use the
+  conventional PowerShell profile under the user's configuration directory.
+- A single legacy `avm setup` PATH block is migrated to the `avm init` marker. Conflicting or
+  duplicate legacy and current markers are refused.
 
-Setup acquires the state lock and creates or repairs only an AVM-owned dispatcher.
+Initialization acquires the state lock and creates or repairs only an AVM-owned dispatcher. The
+shared profile planner combines PATH and completion requests for the same file before applying
+either block, so one operation cannot overwrite the other's planned contents. Before replacing any
+profile or completion file, the atomic-file layer confirms that its contents still match the
+preflight snapshot and refuses a concurrent edit. Existing files on Windows use the native-backed
+replacement path that preserves the destination DACL and other security metadata.
+
+`uninit` is the inverse shell-integration operation. It is global rather than shell-specific
+because all shells share one dispatcher. It plans and preflights every recognized Bash, Zsh, Fish,
+Windows PowerShell, and PowerShell 7 profile before mutation, then removes only exact marked AVM
+blocks. Managed completion files require the AVM ownership header; unmarked files are reported and
+preserved. The dispatcher requires a bounded regular `dispatcher.json` whose protocol and recorded
+SHA-256 match the launcher before either file is removed. A released v1.0 launcher is recognized
+only by its exact published platform digest. If launcher ownership is uncertain, cleanup preserves
+that artifact with a warning and continues removing independently owned integration.
+
+Initialization, completion installation, and uninitialization serialize their complete integration
+lifecycle under the state lock. On Windows, `init` journals PATH-update intent before mutation,
+then records whether it actually added `AVM_HOME/bin` to the user PATH.
+The raw registry value and its string or expandable-string type are preserved, and a Windows
+environment-change notification is broadcast after mutation. `uninit`
+removes one normalized matching entry only when that receipt proves ownership. A legacy entry with
+no receipt is preserved unless `--remove-path` is explicit; that opt-in mode may remove one raw
+environment-variable entry that expands to the same path. Cleanup never removes installed Argo CD
+versions, the personal default, project pins, release cache, or the AVM executable itself. A dry run
+creates nothing and reports the same ownership decisions without writing.
+
+## AVM bootstrap installation
+
+`install.sh` and `install.ps1` are release assets generated from version-placeholder templates.
+The publishing workflow embeds the tag into each script, so an installer obtained through the
+`releases/latest/download` URL still fetches its binary and checksum from one exact release. The
+scripts support only the five AVM targets built by the release matrix and reject all other host
+mappings.
+
+Downloads are anonymous, HTTPS-only, redirect-restricted, time- and size-bounded, and staged in a
+private directory on the destination filesystem. The sidecar must contain exactly one SHA-256
+record naming the expected asset. A staged binary is made executable where necessary and must
+report the embedded release version before it can replace the current executable. Existing
+symlinks, reparse points, non-regular files, or unowned executables are not replaced implicitly.
+After installation, the script invokes the installed executable by absolute path with `init`; an
+initialization failure leaves the verified AVM binary available for an explicit retry but never
+selects or installs an Argo CD release.
 
 ## Diagnostics and machine output
 
@@ -216,8 +300,13 @@ the pass before any report can be serialized.
 - AVM refuses symlinks at managed root and version directories before mutation.
 - Recursive deletion targets only a validated canonical version directory after an atomic rename.
 - AVM refuses to overwrite an unmarked regular `bin/argocd`.
-- A marked dispatcher is compared byte-for-byte with the running AVM executable before it is
-  trusted.
+- Dispatcher metadata is bounded, regular, non-symlinked, protocol-versioned, and bound to the
+  launcher's SHA-256. Package upgrades do not require launcher bytes to match current AVM bytes.
+- The launcher ignores relative PATH entries and delegates with OS argument arrays rather than a
+  shell command string.
+- `uninit` removes only marked profile blocks, header-owned completion files, and a digest-owned
+  launcher; unknown, modified, non-regular, and unprovable artifacts are preserved and reported
+  without blocking independent cleanup.
 - API credentials are absent from the release-download client.
 - Ambient `GH_TOKEN` and `GITHUB_TOKEN` values authenticate only the built-in GitHub endpoint;
   custom API endpoints require the explicit `AVM_GITHUB_TOKEN`.
@@ -239,7 +328,7 @@ the pass before any report can be serialized.
 | `4` | Integrity, checksum, or download-size failure |
 | `5` | Local state, lock, filesystem, or unsupported-platform failure |
 
-## Deliberate non-goals for v0.1
+## Deliberate non-goals for the current design
 
 - The dispatcher does not install missing versions.
 - Project configuration is one exact version, not an executable or extensible environment file.

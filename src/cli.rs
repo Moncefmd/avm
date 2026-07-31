@@ -42,15 +42,36 @@ pub enum Command {
         allow_unverified: bool,
     },
 
-    /// Configure AVM's `argocd` dispatcher and shell integration
-    Setup {
+    /// Create the managed `argocd` command, add it to PATH, and enable tab completion
+    #[command(
+        long_about = "Initialize AVM for a shell. This creates or repairs the managed `argocd` \
+                            dispatcher in AVM_HOME/bin, configures that directory in PATH, and \
+                            installs AVM tab completion. It does not download or select an Argo CD \
+                            CLI version."
+    )]
+    Init {
         /// Shell to configure (auto-detected when omitted)
         #[arg(long)]
         shell: Option<Shell>,
 
-        /// Print the changes without applying them
+        /// Preview the resulting configuration without applying it
         #[arg(long)]
         dry_run: bool,
+
+        /// Configure the managed `argocd` command and PATH without installing tab completion
+        #[arg(long)]
+        no_completion: bool,
+    },
+
+    /// Remove AVM-managed shell integration while preserving installed versions
+    Uninit {
+        /// Preview the cleanup without applying it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove AVM_HOME/bin from the Windows user PATH even without an ownership receipt
+        #[arg(long)]
+        remove_path: bool,
     },
 
     /// Set the user-wide default Argo CD CLI version
@@ -168,13 +189,17 @@ pub enum Command {
         json: bool,
     },
 
-    /// Generate a shell completion script
+    /// Generate or install shell completion
     Completion {
         shell: Shell,
 
-        /// Install the script in the per-user completion directory
+        /// Install and activate completion for the selected shell
         #[arg(long)]
         install: bool,
+
+        /// Preview the resulting installation without applying it
+        #[arg(long, requires = "install")]
+        dry_run: bool,
     },
 
     /// Inspect the local AVM installation
@@ -182,6 +207,12 @@ pub enum Command {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+
+    #[command(name = "__dispatch-v1", hide = true)]
+    DispatchV1 {
+        #[arg(last = true, allow_hyphen_values = true, num_args = 0.., value_name = "ARG")]
+        argocd_args: Vec<OsString>,
     },
 }
 
@@ -349,5 +380,13 @@ mod tests {
     #[test]
     fn exec_requires_a_selector() {
         assert!(Cli::try_parse_from(["avm", "exec", "--", "version"]).is_err());
+    }
+
+    #[test]
+    fn uninit_is_global_and_supports_safe_preview_and_explicit_path_cleanup() {
+        assert!(Cli::try_parse_from(["avm", "uninit"]).is_ok());
+        assert!(Cli::try_parse_from(["avm", "uninit", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["avm", "uninit", "--remove-path"]).is_ok());
+        assert!(Cli::try_parse_from(["avm", "uninit", "--shell", "bash"]).is_err());
     }
 }

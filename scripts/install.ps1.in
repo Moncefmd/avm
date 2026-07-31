@@ -1,0 +1,398 @@
+& {
+    [CmdletBinding()]
+    param(
+        [string] $Version = '@AVM_RELEASE_VERSION@',
+        [string] $AvmHome = $env:AVM_HOME,
+        [switch] $NoInit,
+        [switch] $NoCompletion,
+        [switch] $Force
+    )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
+
+$Repository = 'Moncefmd/avm'
+$MaximumBinaryBytes = 64MB
+$MaximumChecksumBytes = 4KB
+
+function Assert-GitHubDownloadUri {
+    param([Parameter(Mandatory)] [Uri] $Uri)
+
+    if ($Uri.Scheme -cne 'https') {
+        throw "AVM installer: refusing non-HTTPS download URI: $Uri"
+    }
+
+    $hostName = $Uri.DnsSafeHost.ToLowerInvariant()
+    $isGitHubHost = $hostName -eq 'github.com' -or
+        $hostName -eq 'objects.githubusercontent.com' -or
+        $hostName -eq 'release-assets.githubusercontent.com' -or
+        $hostName.EndsWith('.githubusercontent.com', [StringComparison]::Ordinal)
+    if (-not $isGitHubHost) {
+        throw "AVM installer: refusing redirect to non-GitHub host: $hostName"
+    }
+}
+
+function Save-HttpsFileOnce {
+    param(
+        [Parameter(Mandatory)] [Net.Http.HttpClient] $Client,
+        [Parameter(Mandatory)] [Uri] $Uri,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [long] $MaximumBytes
+    )
+
+    $currentUri = $Uri
+    for ($redirectCount = 0; $redirectCount -le 8; $redirectCount++) {
+        Assert-GitHubDownloadUri -Uri $currentUri
+
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $currentUri)
+        $response = $null
+        try {
+            $response = $Client.SendAsync(
+                $request,
+                [Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+        }
+        finally {
+            $request.Dispose()
+        }
+
+        try {
+            $statusCode = [int] $response.StatusCode
+            if ($statusCode -in @(301, 302, 303, 307, 308)) {
+                $location = $response.Headers.Location
+                if ($null -eq $location) {
+                    throw "AVM installer: redirect from $currentUri did not include a Location header"
+                }
+                $currentUri = if ($location.IsAbsoluteUri) {
+                    $location
+                }
+                else {
+                    [Uri]::new($currentUri, $location)
+                }
+                continue
+            }
+
+            if (-not $response.IsSuccessStatusCode) {
+                throw "AVM installer: download failed with HTTP $statusCode from $currentUri"
+            }
+
+            $contentLength = $response.Content.Headers.ContentLength
+            if ($null -ne $contentLength -and $contentLength -gt $MaximumBytes) {
+                throw "AVM installer: download exceeded the $MaximumBytes-byte limit: $currentUri"
+            }
+
+            $inputStream = $null
+            $outputStream = $null
+            try {
+                $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $outputStream = [IO.FileStream]::new(
+                    $Destination,
+                    [IO.FileMode]::Create,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None
+                )
+                $buffer = New-Object byte[] 81920
+                [long] $totalBytes = 0
+                while (($bytesRead = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $totalBytes += $bytesRead
+                    if ($totalBytes -gt $MaximumBytes) {
+                        throw "AVM installer: download exceeded the $MaximumBytes-byte limit: $currentUri"
+                    }
+                    $outputStream.Write($buffer, 0, $bytesRead)
+                }
+                if ($totalBytes -eq 0) {
+                    throw "AVM installer: download was empty: $currentUri"
+                }
+            }
+            finally {
+                if ($null -ne $outputStream) { $outputStream.Dispose() }
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+            }
+            return
+        }
+        finally {
+            if ($null -ne $response) { $response.Dispose() }
+        }
+    }
+
+    throw "AVM installer: too many redirects while downloading $Uri"
+}
+
+function Save-GitHubReleaseFile {
+    param(
+        [Parameter(Mandatory)] [Net.Http.HttpClient] $Client,
+        [Parameter(Mandatory)] [Uri] $Uri,
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [long] $MaximumBytes
+    )
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Save-HttpsFileOnce -Client $Client -Uri $Uri -Destination $Destination -MaximumBytes $MaximumBytes
+            return
+        }
+        catch {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
+function Get-StrictChecksum {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $ExpectedFileName
+    )
+
+    $content = [IO.File]::ReadAllText($Path)
+    $pattern = '\A([0-9A-Fa-f]{64})  ' + [Regex]::Escape($ExpectedFileName) + '\r?\n?\z'
+    $match = [Regex]::Match($content, $pattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    if (-not $match.Success) {
+        throw "AVM installer: malformed checksum record for $ExpectedFileName"
+    }
+    return $match.Groups[1].Value.ToLowerInvariant()
+}
+
+function Assert-SafeDirectory {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if (-not $item.PSIsContainer) {
+            throw "AVM installer: $Description is not a directory: $Path"
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "AVM installer: refusing reparse-point $Description`: $Path"
+        }
+    }
+    else {
+        New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+    }
+}
+
+function Assert-SafeRegularFile {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "AVM installer: refusing non-regular or reparse-point $Description`: $Path"
+    }
+}
+
+function Invoke-AvmInstaller {
+    $resolvedVersion = $Version
+    if ($resolvedVersion.StartsWith('@', [StringComparison]::Ordinal)) {
+        throw 'AVM installer: this is an installer template; download install.ps1 from an AVM GitHub release'
+    }
+    if ($resolvedVersion -notmatch '^v') { $resolvedVersion = "v$resolvedVersion" }
+    if ($resolvedVersion -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') {
+        throw "AVM installer: invalid version '$resolvedVersion'; expected an exact tag such as v1.2.3 or v1.2.3-rc.1"
+    }
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw 'AVM installer: install.ps1 supports Windows; use install.sh on macOS or Linux'
+    }
+    $architecture = if ([string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    else {
+        $env:PROCESSOR_ARCHITEW6432
+    }
+    if ($architecture -notin @('AMD64', 'x86_64')) {
+        throw "AVM installer: no AVM binary is published for windows/$architecture"
+    }
+    $asset = 'avm-windows-amd64.exe'
+
+    $resolvedAvmHome = $AvmHome
+    if ([string]::IsNullOrWhiteSpace($resolvedAvmHome)) {
+        $resolvedAvmHome = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        if ([string]::IsNullOrWhiteSpace($resolvedAvmHome)) {
+            throw 'AVM installer: no user home was found; pass -AvmHome with an absolute directory'
+        }
+        $resolvedAvmHome = Join-Path $resolvedAvmHome '.avm'
+    }
+    $isDriveAbsolute = $resolvedAvmHome -match '^[A-Za-z]:[\\/]'
+    $isUncAbsolute = $resolvedAvmHome -match '^[\\/]{2}(?![?.][\\/])[^\\/]+[\\/][^\\/]+'
+    if (-not $isDriveAbsolute -and -not $isUncAbsolute) {
+        throw 'AVM installer: AvmHome must be an absolute filesystem path'
+    }
+    $resolvedAvmHome = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedAvmHome)
+    $pathRoot = [IO.Path]::GetPathRoot($resolvedAvmHome)
+    if ([string]::IsNullOrWhiteSpace($pathRoot) -or
+        $resolvedAvmHome.TrimEnd('\', '/') -eq $pathRoot.TrimEnd('\', '/')) {
+        throw 'AVM installer: AvmHome must be an absolute directory below the filesystem root'
+    }
+
+    Assert-SafeDirectory -Path $resolvedAvmHome -Description 'AVM home'
+    $binDirectory = Join-Path $resolvedAvmHome 'bin'
+    Assert-SafeDirectory -Path $binDirectory -Description 'AVM bin directory'
+
+    $destination = Join-Path $binDirectory 'avm.exe'
+    $marker = Join-Path $binDirectory 'avm.exe.sha256'
+    Assert-SafeRegularFile -Path $destination -Description 'AVM destination'
+    Assert-SafeRegularFile -Path $marker -Description 'installer marker'
+
+    $stagingDirectory = Join-Path $binDirectory ('.avm-install-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stagingDirectory -ErrorAction Stop | Out-Null
+    $stagedBinary = Join-Path $stagingDirectory $asset
+    $stagedChecksum = Join-Path $stagingDirectory "$asset.sha256"
+    $stagedMarker = Join-Path $stagingDirectory 'avm.exe.sha256'
+    $binaryBackup = Join-Path $stagingDirectory 'avm.previous.exe'
+    $markerBackup = Join-Path $stagingDirectory 'avm.exe.previous.sha256'
+
+    $handler = $null
+    $client = $null
+    $previousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(120)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd("avm-installer/$($resolvedVersion.TrimStart('v'))")
+
+        $releaseRoot = "https://github.com/$Repository/releases/download/$resolvedVersion"
+        Save-GitHubReleaseFile -Client $client -Uri "$releaseRoot/$asset.sha256" -Destination $stagedChecksum -MaximumBytes $MaximumChecksumBytes
+        Save-GitHubReleaseFile -Client $client -Uri "$releaseRoot/$asset" -Destination $stagedBinary -MaximumBytes $MaximumBinaryBytes
+
+        $expectedDigest = Get-StrictChecksum -Path $stagedChecksum -ExpectedFileName $asset
+        $actualDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedBinary).Hash.ToLowerInvariant()
+        if ($actualDigest -cne $expectedDigest) {
+            throw "AVM installer: checksum mismatch for $asset; the existing installation was not changed"
+        }
+
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $versionOutput = @(& $stagedBinary --version 2>&1)
+            $versionExitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($versionExitCode -ne 0) {
+            throw "AVM installer: the verified $asset binary could not run on this host"
+        }
+        $reportedVersion = ($versionOutput -join "`n").Trim()
+        $expectedVersion = 'avm ' + $resolvedVersion.TrimStart('v')
+        if ($reportedVersion -cne $expectedVersion) {
+            throw "AVM installer: the verified binary reported '$reportedVersion', expected '$expectedVersion'"
+        }
+        $supportsInit = $false
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $stagedBinary init --help *> $null
+            $supportsInit = $LASTEXITCODE -eq 0
+        }
+        catch {
+            $supportsInit = $false
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if (-not $NoInit -and -not $supportsInit) {
+            throw "AVM installer: $resolvedVersion predates 'avm init'; rerun a downloaded installer with -NoInit to install that legacy release"
+        }
+
+        $existingDigest = $null
+        if (Test-Path -LiteralPath $destination) {
+            $existingDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+        }
+
+        $markerDigest = $null
+        if (Test-Path -LiteralPath $marker) {
+            try {
+                $markerDigest = Get-StrictChecksum -Path $marker -ExpectedFileName 'avm.exe'
+            }
+            catch {
+                if (-not $Force) {
+                    throw "AVM installer: invalid installer marker at $marker; rerun a downloaded installer with -Force to replace it"
+                }
+            }
+        }
+
+        if ($null -ne $existingDigest -and $existingDigest -cne $expectedDigest) {
+            if ($null -eq $markerDigest -or $markerDigest -cne $existingDigest) {
+                if (-not $Force) {
+                    throw "AVM installer: refusing to replace unmanaged $destination; rerun a downloaded installer with -Force if that is intentional"
+                }
+            }
+        }
+
+        $utf8WithoutBom = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText($stagedMarker, "$expectedDigest  avm.exe`n", $utf8WithoutBom)
+
+        if ($existingDigest -cne $expectedDigest) {
+            if (Test-Path -LiteralPath $destination) {
+                [IO.File]::Replace($stagedBinary, $destination, $binaryBackup, $true)
+            }
+            else {
+                [IO.File]::Move($stagedBinary, $destination)
+            }
+        }
+        if (Test-Path -LiteralPath $marker) {
+            [IO.File]::Replace($stagedMarker, $marker, $markerBackup, $true)
+        }
+        else {
+            [IO.File]::Move($stagedMarker, $marker)
+        }
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
+        if ($null -ne $client) { $client.Dispose() }
+        if ($null -ne $handler) { $handler.Dispose() }
+        foreach ($temporaryFile in @(
+            $stagedBinary,
+            $stagedChecksum,
+            $stagedMarker,
+            $binaryBackup,
+            $markerBackup
+        )) {
+            Remove-Item -LiteralPath $temporaryFile -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $stagingDirectory -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "AVM $resolvedVersion is installed at $destination."
+    if ($NoInit) {
+        Write-Host 'Shell initialization was skipped. No Argo CD version was installed or selected.'
+        if ($supportsInit) {
+            Write-Host "Run `"$destination`" --avm-home `"$resolvedAvmHome`" init when you are ready."
+        }
+        else {
+            Write-Host "This legacy release uses setup; run `"$destination`" --avm-home `"$resolvedAvmHome`" setup when you are ready."
+        }
+        return
+    }
+
+    $initArguments = @('--avm-home', $resolvedAvmHome, 'init', '--shell', 'powershell')
+    if ($NoCompletion) { $initArguments += '--no-completion' }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $destination @initArguments
+        $initExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($initExitCode -ne 0) {
+        throw "AVM installer: AVM $resolvedVersion was installed, but shell initialization failed. No Argo CD version was installed or selected. Retry: `"$destination`" --avm-home `"$resolvedAvmHome`" init --shell powershell"
+    }
+
+    Write-Host 'Open a new terminal, then run:'
+    Write-Host '  avm default stable'
+}
+
+Invoke-AvmInstaller
+} @args

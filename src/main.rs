@@ -1,19 +1,19 @@
 use std::process::{self, ExitCode};
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 fn main() -> ExitCode {
-    if avm::shim::is_argocd_invocation() {
-        return match avm::shim::dispatch() {
+    if avm::launcher::is_argocd_invocation() {
+        return match avm::launcher::run() {
             Ok(code) => process::exit(code),
             Err(error) => {
-                eprintln!("avm dispatcher error: {error}");
+                eprintln!("avm dispatcher launcher error: {error}");
                 ExitCode::from(error.exit_code())
             }
         };
     }
 
-    clap_complete::CompleteEnv::with_factory(avm::Cli::command).complete();
+    avm::complete_env();
 
     match avm::run(avm::Cli::parse()) {
         Ok(avm::AppOutcome::Success) => ExitCode::SUCCESS,

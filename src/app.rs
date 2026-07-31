@@ -1,18 +1,16 @@
 use std::ffi::OsString;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::CommandFactory;
-use directories::BaseDirs;
 use serde::Serialize;
-use tempfile::NamedTempFile;
 
 use crate::catalog;
-use crate::cli::{Cli, Command, Shell};
+use crate::cli::{Cli, Command};
+use crate::completion;
 use crate::error::{AvmError, Result};
 use crate::github::GitHubClient;
 use crate::installer;
+use crate::onboarding;
 use crate::platform::Platform;
 use crate::resolver::{
     Resolution, ResolutionSource, VERSION_ENV, remove_project_pin, resolve_environment_override,
@@ -51,8 +49,24 @@ pub fn run(cli: Cli) -> Result<AppOutcome> {
             installer::install(&store, selector.as_deref(), force, allow_unverified)?;
             AppOutcome::Success
         }
-        Command::Setup { shell, dry_run } => {
-            shell::setup(&store, shell.unwrap_or_else(shell::detected_shell), dry_run)?;
+        Command::Init {
+            shell,
+            dry_run,
+            no_completion,
+        } => {
+            onboarding::init(
+                &store,
+                shell.unwrap_or_else(shell::detected_shell),
+                !no_completion,
+                dry_run,
+            )?;
+            AppOutcome::Success
+        }
+        Command::Uninit {
+            dry_run,
+            remove_path,
+        } => {
+            onboarding::uninit(&store, dry_run, remove_path)?;
             AppOutcome::Success
         }
         Command::Default {
@@ -134,13 +148,20 @@ pub fn run(cli: Cli) -> Result<AppOutcome> {
             info(&store, &selector, refresh, json)?;
             AppOutcome::Success
         }
-        Command::Completion { shell, install } => {
-            completion(shell, install)?;
+        Command::Completion {
+            shell,
+            install,
+            dry_run,
+        } => {
+            completion::command(&store, shell, install, dry_run)?;
             AppOutcome::Success
         }
         Command::Doctor { json } => {
             doctor(&store, json)?;
             AppOutcome::Success
+        }
+        Command::DispatchV1 { argocd_args } => {
+            AppOutcome::ChildExit(shim::dispatch(&store, argocd_args)?)
         }
     };
     Ok(outcome)
@@ -175,7 +196,6 @@ fn pin(store: &Store, selector: &str, force: bool, allow_unverified: bool) -> Re
     if !store.is_installed(&version)? {
         return Err(AvmError::NotInstalled(version));
     }
-    store.ensure_dispatcher()?;
     let cwd = current_directory()?;
     let path = write_project_pin(&cwd, &version)?;
     println!("Pinned Argo CD {version} in {}.", path.display());
@@ -437,49 +457,6 @@ fn info(store: &Store, requested: &str, refresh: bool, json: bool) -> Result<()>
         }
     }
     Ok(())
-}
-
-fn completion(shell: Shell, install: bool) -> Result<()> {
-    if !install {
-        write_dynamic_completion(shell, &mut io::stdout())?;
-        return Ok(());
-    }
-
-    if shell == Shell::Powershell {
-        println!(
-            "PowerShell completion installation is shell-profile specific.\n\
-             Run `avm completion powershell > avm.ps1` and dot-source it from `$PROFILE`."
-        );
-        return Ok(());
-    }
-
-    let home = BaseDirs::new()
-        .ok_or_else(|| AvmError::Message("could not determine the home directory".to_owned()))?
-        .home_dir()
-        .to_path_buf();
-    let destination = completion_path(shell, &home)?;
-    let mut bytes = Vec::new();
-    write_dynamic_completion(shell, &mut bytes)?;
-    write_completion_atomic(&destination, &bytes)?;
-    println!("Installed {shell} completion at {}.", destination.display());
-    if shell == Shell::Zsh {
-        println!("Ensure ~/.zsh/completions is present in your zsh fpath.");
-    }
-    Ok(())
-}
-
-fn write_dynamic_completion(shell: Shell, output: &mut dyn io::Write) -> Result<()> {
-    use clap_complete::env::{Bash, EnvCompleter, Fish, Powershell, Zsh};
-
-    let completer: &dyn EnvCompleter = match shell {
-        Shell::Bash => &Bash,
-        Shell::Zsh => &Zsh,
-        Shell::Fish => &Fish,
-        Shell::Powershell => &Powershell,
-    };
-    completer
-        .write_registration("COMPLETE", "avm", "avm", "avm", output)
-        .map_err(|error| AvmError::io(format!("generate {shell} completion"), error))
 }
 
 fn doctor(store: &Store, json: bool) -> Result<()> {
@@ -747,49 +724,6 @@ fn warn_if_path_missing(store: &Store) {
     }
 }
 
-fn completion_path(shell: Shell, home: &Path) -> Result<PathBuf> {
-    match shell {
-        Shell::Bash => Ok(home
-            .join(".local")
-            .join("share")
-            .join("bash-completion")
-            .join("completions")
-            .join("avm")),
-        Shell::Zsh => Ok(home.join(".zsh").join("completions").join("_avm")),
-        Shell::Fish => Ok(home
-            .join(".config")
-            .join("fish")
-            .join("completions")
-            .join("avm.fish")),
-        Shell::Powershell => Err(AvmError::CompletionInstallUnsupported(
-            "powershell".to_owned(),
-        )),
-    }
-}
-
-fn write_completion_atomic(destination: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| AvmError::UnsafePath(destination.to_path_buf()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| AvmError::io(format!("create {}", parent.display()), error))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| AvmError::io("create temporary completion file", error))?;
-    std::io::Write::write_all(&mut temporary, bytes)
-        .map_err(|error| AvmError::io("write completion file", error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| AvmError::io("sync completion file", error))?;
-    temporary.persist(destination).map_err(|error| {
-        AvmError::io(
-            format!("replace completion {}", destination.display()),
-            error.error,
-        )
-    })?;
-    Ok(())
-}
-
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -838,22 +772,4 @@ struct DoctorReport {
     dispatcher_healthy: bool,
     installed_versions: usize,
     corrupt_versions: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserves_existing_completion_locations() {
-        let home = Path::new("/home/user");
-        assert_eq!(
-            completion_path(Shell::Zsh, home).unwrap(),
-            home.join(".zsh/completions/_avm")
-        );
-        assert_eq!(
-            completion_path(Shell::Fish, home).unwrap(),
-            home.join(".config/fish/completions/avm.fish")
-        );
-    }
 }

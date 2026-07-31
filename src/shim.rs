@@ -1,54 +1,21 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::process::Command;
 
 use crate::error::{AvmError, Result};
-use crate::platform::Platform;
 use crate::resolver::{VERSION_ENV, resolve_environment_override, resolve_required};
-use crate::store::{Paths, Store};
+use crate::store::Store;
 
-pub fn is_argocd_invocation() -> bool {
-    std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(std::path::Path::file_stem)
-        .map(|name| os_str_eq_ignore_ascii_case(name, "argocd"))
-        .unwrap_or(false)
-}
-
-pub fn dispatch() -> Result<i32> {
-    let current = std::env::current_exe()
-        .map_err(|error| AvmError::io("locate the AVM dispatcher", error))?;
-    let bin = current.parent().ok_or_else(|| {
-        AvmError::Message("the AVM dispatcher has no parent directory".to_owned())
-    })?;
-    if !bin
-        .file_name()
-        .is_some_and(|name| os_str_eq_ignore_ascii_case(name, "bin"))
-    {
-        return Err(AvmError::Message(format!(
-            "the AVM dispatcher must be installed under an AVM `bin` directory: {}",
-            current.display()
-        )));
-    }
-    let root = bin.parent().ok_or_else(|| {
-        AvmError::Message("the AVM dispatcher cannot determine its AVM home".to_owned())
-    })?;
-    let store = Store::new(Paths::new(root.to_path_buf()), Platform::current()?);
+pub fn dispatch(store: &Store, arguments: Vec<OsString>) -> Result<i32> {
     let environment = std::env::var_os(VERSION_ENV);
     let resolution = match resolve_environment_override(environment.as_deref())? {
         Some(resolution) => resolution,
         None => {
             let cwd = std::env::current_dir()
                 .map_err(|error| AvmError::io("determine the current directory", error))?;
-            resolve_required(&store, None, &cwd)?
+            resolve_required(store, None, &cwd)?
         }
     };
-    execute_with_guard(
-        &store,
-        &resolution.version,
-        std::env::args_os().skip(1),
-        Some(&current),
-    )
+    execute_with_guard(store, &resolution.version, arguments, None)
 }
 
 pub fn execute<I>(store: &Store, version: &str, arguments: I) -> Result<i32>
@@ -90,13 +57,6 @@ where
         }
     }
     Ok(1)
-}
-
-fn os_str_eq_ignore_ascii_case(value: &OsStr, expected: &str) -> bool {
-    value
-        .to_str()
-        .map(|value| value.eq_ignore_ascii_case(expected))
-        .unwrap_or(false)
 }
 
 fn same_file_best_effort(left: &std::path::Path, right: &std::path::Path) -> bool {
