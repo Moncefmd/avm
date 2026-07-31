@@ -32,20 +32,78 @@ maintain PATH entries independently. AVM turns the selected version into explici
 - Per-version and default-state locks, atomic project-pin writes, and guarded execution.
 - Native Linux, macOS, and Windows behavior without requiring symlink privileges.
 
-## Install
+## Install and initialize
 
-Download the binary for your system from
-[GitHub Releases](https://github.com/Moncefmd/avm/releases), rename it to `avm` (or `avm.exe` on
-Windows), and place it in a directory already on PATH.
+Release-attached installers begin with the first release containing `avm init`; the existing
+`v1.0.0` release predates this installation flow.
 
-Raw Linux and macOS downloads need their executable bit restored:
+Windows PowerShell:
 
-```sh
-chmod +x avm
-sudo install -m 0755 avm /usr/local/bin/avm
+```powershell
+irm https://github.com/Moncefmd/avm/releases/latest/download/install.ps1 | iex
 ```
 
-You can also build from source with Rust 1.97.1:
+macOS or Linux:
+
+```sh
+curl -q --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Moncefmd/avm/releases/latest/download/install.sh | sh
+```
+
+The release-attached installer is pinned to the AVM release that contains it. It downloads the
+matching binary and checksum, verifies the SHA-256 digest, and then atomically installs AVM under
+`~/.avm/bin` (or `AVM_HOME/bin`). It runs `avm init` to configure that one directory for both `avm`
+and the managed `argocd` command, including tab completion. It does not require administrator/root
+privileges and does not install or select an Argo CD version.
+
+Open a new terminal, then choose a personal Argo CD fallback:
+
+```sh
+avm default stable
+argocd version --client
+```
+
+### Inspect or customize the installer
+
+If you prefer to inspect remote code before running it, download the installer first:
+
+```powershell
+Invoke-WebRequest https://github.com/Moncefmd/avm/releases/latest/download/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1
+```
+
+```sh
+curl -q --proto '=https' --tlsv1.2 -fLO \
+  https://github.com/Moncefmd/avm/releases/latest/download/install.sh
+less install.sh
+sh install.sh
+```
+
+Both installers accept an exact release version and a mode that installs only the AVM executable:
+
+```powershell
+.\install.ps1 -Version v1.2.3 -NoInit
+```
+
+```sh
+sh install.sh --version v1.2.3 --no-init
+```
+
+Use `-NoCompletion` or `--no-completion` to initialize without tab completion. Rerunning the
+installer upgrades or repairs an installer-managed AVM executable, then refreshes shell
+integration. It refuses an unrelated file already at the destination unless `-Force` or `--force`
+is explicit, and it never follows a symlink or Windows reparse point there. Releases that predate
+`avm init`, including `v1.0.0`, can be installed only with `-NoInit` or `--no-init`.
+
+### Alternative installation methods
+
+You can still download the binary and its `.sha256` file directly from
+[GitHub Releases](https://github.com/Moncefmd/avm/releases), verify it, rename it to `avm` (or
+`avm.exe` on Windows), place it on PATH, and run `avm init` manually. The legacy `v1.0.0` release
+uses `avm setup` instead.
+
+Or build from source with Rust 1.97.1:
 
 ```sh
 git clone https://github.com/Moncefmd/avm.git
@@ -53,13 +111,14 @@ cd avm
 cargo build --release --locked
 ```
 
-The resulting executable is `target/release/avm` (`target\release\avm.exe` on Windows).
+The resulting executable is `target/release/avm` (`target\release\avm.exe` on Windows). Put it on
+PATH and run `avm init`.
 
 ## Quick start
 
 ```sh
-# Add AVM's dispatcher to your shell environment.
-avm setup
+# Skip this when the release installer already initialized AVM.
+avm init
 
 # Choose a personal fallback. AVM installs the resolved release if necessary.
 avm default stable
@@ -72,25 +131,49 @@ avm status
 argocd version --client
 ```
 
-`avm setup` applies the required change idempotently. It creates the managed dispatcher in
-`~/.avm/bin` and configures the selected or detected shell. Preview the change without writing it
-with:
+`avm init` prepares AVM for the selected or detected shell. It creates an AVM-managed command named
+`argocd` in `~/.avm/bin`, adds that directory to PATH, and installs tab completion. That command is
+a protocol-stable launcher: it finds `avm` in normal absolute PATH order, falls back to an adjacent
+standalone installation when needed, and delegates the entirely local version selection to it.
+Upgrading AVM at that active location therefore updates dispatch behavior without requiring a new
+launcher copy. Initialization does not download or select an Argo CD version.
+
+Preview the resulting configuration without writing it:
 
 ```sh
-avm setup --dry-run
+avm init --dry-run
 ```
 
 Select a shell explicitly when detection is not appropriate:
 
 ```sh
-avm setup --shell zsh
-avm setup --shell fish
-avm setup --shell powershell
+avm init --shell zsh
+avm init --shell fish
+avm init --shell powershell
 ```
 
-On Bash, AVM maintains marked blocks in both `.bashrc` and the active login profile so login and
-non-login shells work. Zsh and Fish receive one marked profile block. On Windows, PowerShell setup
-updates the per-user PATH.
+Use `avm init --no-completion` when you want only the managed `argocd` command and PATH integration.
+On Bash, AVM maintains marked PATH blocks in both `.bashrc` and the active login profile, plus a
+completion block in `.bashrc`. Zsh receives PATH and completion blocks in `.zshrc`; Fish uses its
+standard configuration and completion locations. On Windows, PowerShell initialization updates
+the per-user PATH and activates completion in the current-user profiles for both Windows PowerShell
+and PowerShell 7.
+
+To remove every recognized AVM-managed shell integration while keeping installed Argo CD versions,
+the personal default, project pins, and cached release metadata:
+
+```sh
+avm uninit --dry-run
+avm uninit
+```
+
+`uninit` removes marked PATH and completion blocks from all supported shell profiles, managed
+completion scripts, and the owned dispatcher launcher. On Windows, AVM removes its user-PATH entry
+only when `init` recorded that it added the entry. For a legacy entry without that receipt, inspect
+the preview and pass `avm uninit --remove-path` explicitly; this also recognizes an equivalent raw
+`%VARIABLE%` entry. A modified or otherwise uncertain
+dispatcher is preserved with a warning while independently owned profile and completion cleanup
+continues.
 
 ## Selecting a version
 
@@ -119,16 +202,31 @@ Commands that persist a choice resolve it first and write a canonical tag such a
 
 ## Commands
 
-### Configure the shell
+### Initialize AVM
 
 ```sh
-avm setup
-avm setup --shell bash
-avm setup --dry-run
+avm init
+avm init --shell bash
+avm init --dry-run
+avm init --no-completion
 ```
 
-Setup is safe to run repeatedly. `--dry-run` prints the proposed changes without modifying the
-dispatcher, shell profile, or user PATH.
+Initialization is safe to run repeatedly. `--dry-run` shows the resulting dispatcher, PATH,
+profile, and completion configuration without modifying anything. `--no-completion` skips only tab
+completion; it still creates the managed `argocd` command and configures PATH. `default` and `pin`
+change version selection only; they never create shell integration implicitly.
+
+### Remove shell integration
+
+```sh
+avm uninit --dry-run
+avm uninit
+avm uninit --remove-path  # explicit legacy Windows PATH cleanup
+```
+
+Cleanup is global rather than shell-specific because the dispatcher is shared by every configured
+shell. Only marked or digest-owned AVM artifacts are removed. Selection state, downloaded Argo CD
+versions, and cache data remain available if AVM is initialized again later.
 
 ### Install releases
 
@@ -234,7 +332,7 @@ version is the personal default or is pinned in the current project. If another 
 executing it, AVM waits up to ten seconds for the version lock; it proceeds if execution finishes
 or fails without removing anything if the lock remains busy.
 
-### Generate shell completion
+### Generate or reinstall shell completion
 
 ```sh
 avm completion bash
@@ -242,12 +340,17 @@ avm completion zsh
 avm completion fish
 avm completion powershell
 avm completion bash --install
+avm completion powershell --install
+avm completion zsh --install --dry-run
 ```
 
 Generated completion reads installed versions and cached release metadata locally. It never
-contacts GitHub during completion. `--install` writes Bash, Zsh, or Fish completion to its per-user
-completion directory. PowerShell completion is profile-specific, so its `--install` form prints
-generation and dot-sourcing instructions instead.
+contacts GitHub while you press Tab. Without `--install`, the generated registration script is
+written to standard output. `--install` writes the managed script to the selected shell's per-user
+completion location and activates it where a profile entry is needed. For PowerShell, the script is
+stored under `AVM_HOME/completions` and safely dot-sourced from the current-user profile. Use
+`--dry-run` with `--install` to preview those changes. PowerShell completion parses typed input as
+data and never evaluates it as a command.
 
 ### Diagnose the installation
 
@@ -279,7 +382,8 @@ environment variables are recognized:
 
 Every management command also accepts the global `--avm-home <DIR>` option for a one-command
 override of `AVM_HOME`. When using a custom home persistently, run
-`avm --avm-home <DIR> setup` so the dispatcher from that home is the one configured in PATH.
+`avm --avm-home <DIR> init` so the dispatcher and PowerShell completion script from that home are
+the ones configured for your shell.
 
 `GH_TOKEN` and `GITHUB_TOKEN` are never forwarded to an `AVM_GITHUB_API_URL` override; set
 `AVM_GITHUB_TOKEN` explicitly when a mirror requires authentication. Tokens are sent only to
@@ -291,6 +395,8 @@ uses a separate unauthenticated client for release-asset downloads.
 ```text
 ~/.avm/
 |-- bin/
+|   |-- avm[.exe]              # when installed by the release installer
+|   |-- avm[.exe].sha256       # installer ownership and digest marker
 |   `-- argocd[.exe]
 |-- versions/
 |   `-- v3.4.5/
@@ -298,16 +404,20 @@ uses a separate unauthenticated client for release-asset downloads.
 |       `-- install.json
 |-- state/
 |   |-- default
-|   `-- dispatcher.json
+|   |-- dispatcher.json
+|   `-- integration.json         # Windows user-PATH ownership receipt when applicable
 |-- cache/
 |   `-- releases.json
+|-- completions/
+|   `-- avm.ps1
 `-- locks/
     |-- state.lock
     `-- v3.4.5.lock
 ```
 
 Every installed release has `install.json` metadata with its recorded SHA-256 digest and
-verification source. The dispatcher and persisted selections refer only to canonical exact tags.
+verification source. `dispatcher.json` binds the launcher protocol and SHA-256 digest to AVM
+ownership. The dispatcher and persisted selections refer only to canonical exact tags.
 
 ## Supported Argo CD assets
 

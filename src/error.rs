@@ -123,8 +123,10 @@ pub enum AvmError {
     #[error("cached release metadata is invalid: {0}")]
     InvalidCache(String),
 
-    #[error("completion installation is not supported for {0}; generate the script instead")]
-    CompletionInstallUnsupported(String),
+    #[error(
+        "refusing to replace {path}: it changed after AVM inspected it; review the file and rerun the command"
+    )]
+    ConcurrentFileChange { path: PathBuf },
 
     #[error("{context}: {source}")]
     Io {

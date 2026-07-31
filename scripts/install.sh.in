@@ -1,0 +1,356 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME='AVM installer'
+REPOSITORY='Moncefmd/avm'
+EMBEDDED_VERSION='@AVM_RELEASE_VERSION@'
+MAX_BINARY_BYTES=67108864
+MAX_CHECKSUM_BYTES=4096
+
+staging_dir=''
+staged_binary=''
+staged_checksum=''
+staged_marker=''
+
+usage() {
+    cat <<'EOF'
+Install AVM and initialize its shell integration.
+
+Usage:
+  install.sh [--version <vX.Y.Z>] [--shell <bash|zsh|fish|powershell>]
+             [--no-init] [--no-completion] [--force]
+
+Options:
+  --version <version> Install an exact AVM release instead of the
+                      release containing this installer.
+  --shell <shell>     Configure a specific shell. AVM auto-detects it when
+                      this option is omitted.
+  --no-init           Install the AVM binary without changing PATH, creating
+                      the managed argocd command, or installing completion.
+  --no-completion     Initialize PATH and the managed argocd command without
+                      installing tab completion.
+  --force             Replace an existing AVM binary that has no valid
+                      installer ownership marker.
+  -h, --help          Show this help.
+
+Set AVM_HOME to override the default ~/.avm directory.
+EOF
+}
+
+fail() {
+    printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$staging_dir" ]; then
+        [ -z "$staged_binary" ] || rm -f "$staged_binary"
+        [ -z "$staged_checksum" ] || rm -f "$staged_checksum"
+        [ -z "$staged_marker" ] || rm -f "$staged_marker"
+        rmdir "$staging_dir" 2>/dev/null || true
+    fi
+}
+
+trap cleanup 0
+trap 'cleanup; exit 1' 1 2 3 15
+
+version=$EMBEDDED_VERSION
+selected_shell=''
+no_init=0
+no_completion=0
+force=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --version)
+            [ "$#" -ge 2 ] || fail '--version requires a value'
+            version=$2
+            shift 2
+            ;;
+        --version=*)
+            version=${1#*=}
+            shift
+            ;;
+        --shell)
+            [ "$#" -ge 2 ] || fail '--shell requires a value'
+            selected_shell=$2
+            shift 2
+            ;;
+        --shell=*)
+            selected_shell=${1#*=}
+            shift
+            ;;
+        --no-init)
+            no_init=1
+            shift
+            ;;
+        --no-completion)
+            no_completion=1
+            shift
+            ;;
+        --force)
+            force=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            [ "$#" -eq 0 ] || fail "unexpected argument: $1"
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+case "$version" in
+    @*)
+        fail 'this is an installer template; download install.sh from an AVM GitHub release'
+        ;;
+    v*) ;;
+    *) version="v$version" ;;
+esac
+
+if ! printf '%s\n' "$version" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+    fail "invalid version '$version'; expected an exact tag such as v1.2.3 or v1.2.3-rc.1"
+fi
+
+case "$selected_shell" in
+    ''|bash|zsh|fish|powershell) ;;
+    *) fail "unsupported shell '$selected_shell'; expected bash, zsh, fish, or powershell" ;;
+esac
+
+command -v curl >/dev/null 2>&1 || fail 'curl is required'
+command -v awk >/dev/null 2>&1 || fail 'awk is required'
+command -v mktemp >/dev/null 2>&1 || fail 'mktemp is required'
+
+case "$(uname -s)" in
+    Linux) asset_os='linux' ;;
+    Darwin) asset_os='darwin' ;;
+    *) fail "no AVM binary is published for operating system $(uname -s)" ;;
+esac
+
+case "$(uname -m)" in
+    x86_64|amd64) asset_arch='amd64' ;;
+    aarch64|arm64) asset_arch='arm64' ;;
+    *) fail "no AVM binary is published for $asset_os/$(uname -m)" ;;
+esac
+
+asset="avm-$asset_os-$asset_arch"
+
+avm_home=${AVM_HOME-}
+if [ -z "$avm_home" ]; then
+    [ -n "${HOME-}" ] || fail 'HOME is not set; set AVM_HOME to an absolute directory'
+    avm_home=$HOME/.avm
+fi
+case "$avm_home" in
+    /*) ;;
+    *) fail 'AVM_HOME must be an absolute path' ;;
+esac
+case "$avm_home" in
+    *'/../'*|*'/./'*|*'/..'|*'/.' )
+        fail 'AVM_HOME must not contain . or .. path segments'
+        ;;
+    *[!/]*) ;;
+    *) fail 'AVM_HOME cannot be the filesystem root' ;;
+esac
+
+umask 077
+
+if [ -L "$avm_home" ]; then
+    fail "refusing symlinked AVM_HOME: $avm_home"
+fi
+if [ -e "$avm_home" ] && [ ! -d "$avm_home" ]; then
+    fail "AVM_HOME is not a directory: $avm_home"
+fi
+mkdir -p "$avm_home"
+resolved_avm_home=$(CDPATH='' cd "$avm_home" 2>/dev/null && pwd -P) || \
+    fail "could not resolve AVM_HOME: $avm_home"
+case "$resolved_avm_home" in
+    *[!/]*) ;;
+    *) fail 'AVM_HOME cannot resolve to the filesystem root' ;;
+esac
+avm_home=$resolved_avm_home
+
+bin_dir=$avm_home/bin
+if [ -L "$bin_dir" ]; then
+    fail "refusing symlinked AVM bin directory: $bin_dir"
+fi
+if [ -e "$bin_dir" ] && [ ! -d "$bin_dir" ]; then
+    fail "AVM bin path is not a directory: $bin_dir"
+fi
+mkdir -p "$bin_dir"
+
+destination=$bin_dir/avm
+marker=$bin_dir/avm.sha256
+
+if [ -L "$destination" ]; then
+    fail "refusing to replace symlinked destination: $destination"
+fi
+if [ -e "$destination" ] && [ ! -f "$destination" ]; then
+    fail "refusing to replace non-regular destination: $destination"
+fi
+if [ -L "$marker" ]; then
+    fail "refusing symlinked installer marker: $marker"
+fi
+if [ -e "$marker" ] && [ ! -f "$marker" ]; then
+    fail "refusing non-regular installer marker: $marker"
+fi
+
+staging_dir=$(mktemp -d "$bin_dir/.avm-install.XXXXXX") || fail 'could not create a staging directory'
+staged_binary=$staging_dir/$asset
+staged_checksum=$staging_dir/$asset.sha256
+staged_marker=$staging_dir/avm.sha256
+
+download() {
+    download_url=$1
+    download_destination=$2
+    maximum_bytes=$3
+
+    curl -q \
+        --proto '=https' \
+        --proto-redir '=https' \
+        --tlsv1.2 \
+        --location \
+        --fail \
+        --silent \
+        --show-error \
+        --connect-timeout 10 \
+        --max-time 120 \
+        --retry 2 \
+        --retry-delay 1 \
+        --retry-connrefused \
+        --max-filesize "$maximum_bytes" \
+        --output "$download_destination" \
+        "$download_url" || fail "download failed: $download_url"
+
+    downloaded_bytes=$(wc -c < "$download_destination" | tr -d '[:space:]')
+    case "$downloaded_bytes" in
+        ''|*[!0-9]*) fail "could not determine download size: $download_url" ;;
+    esac
+    [ "$downloaded_bytes" -gt 0 ] || fail "download was empty: $download_url"
+    [ "$downloaded_bytes" -le "$maximum_bytes" ] || fail "download exceeded the size limit: $download_url"
+}
+
+checksum_digest() {
+    checksum_file=$1
+    expected_name=$2
+
+    awk -v expected="$expected_name" '
+        BEGIN { valid = 1 }
+        NR > 1 { valid = 0; next }
+        {
+            sub(/\r$/, "")
+            digest = substr($0, 1, 64)
+            separator = substr($0, 65, 2)
+            filename = substr($0, 67)
+            if (length($0) != 66 + length(expected) ||
+                digest !~ /^[0-9A-Fa-f]+$/ ||
+                separator != "  " || filename != expected) {
+                valid = 0
+                next
+            }
+            print tolower(digest)
+        }
+        END { if (NR != 1 || !valid) exit 1 }
+    ' "$checksum_file"
+}
+
+file_digest() {
+    digest_path=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$digest_path" | awk '{ print tolower($1) }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$digest_path" | awk '{ print tolower($1) }'
+    else
+        fail 'sha256sum or shasum is required to verify the download'
+    fi
+}
+
+release_root="https://github.com/$REPOSITORY/releases/download/$version"
+download "$release_root/$asset.sha256" "$staged_checksum" "$MAX_CHECKSUM_BYTES"
+download "$release_root/$asset" "$staged_binary" "$MAX_BINARY_BYTES"
+
+expected_digest=$(checksum_digest "$staged_checksum" "$asset") || \
+    fail "malformed checksum record for $asset"
+actual_digest=$(file_digest "$staged_binary")
+[ "$actual_digest" = "$expected_digest" ] || \
+    fail "checksum mismatch for $asset; the existing installation was not changed"
+
+chmod 0755 "$staged_binary"
+reported_version=$("$staged_binary" --version 2>/dev/null) || \
+    fail "the verified $asset binary could not run on this host"
+expected_version="avm ${version#v}"
+[ "$reported_version" = "$expected_version" ] || \
+    fail "the verified binary reported '$reported_version', expected '$expected_version'"
+supports_init=1
+if ! "$staged_binary" init --help >/dev/null 2>&1; then
+    supports_init=0
+fi
+if [ "$no_init" -eq 0 ] && [ "$supports_init" -eq 0 ]; then
+    fail "$version predates 'avm init'; rerun with --no-init to install that legacy release"
+fi
+
+existing_digest=''
+if [ -e "$destination" ]; then
+    existing_digest=$(file_digest "$destination")
+fi
+
+marker_digest=''
+if [ -e "$marker" ]; then
+    marker_digest=$(checksum_digest "$marker" 'avm') || {
+        [ "$force" -eq 1 ] || fail "invalid installer marker at $marker; rerun with --force to replace it"
+        marker_digest=''
+    }
+fi
+
+if [ -n "$existing_digest" ] && [ "$existing_digest" != "$expected_digest" ]; then
+    if [ -z "$marker_digest" ] || [ "$marker_digest" != "$existing_digest" ]; then
+        [ "$force" -eq 1 ] || \
+            fail "refusing to replace unmanaged $destination; rerun with --force if that is intentional"
+    fi
+fi
+
+printf '%s  avm\n' "$expected_digest" > "$staged_marker"
+chmod 0600 "$staged_marker"
+
+if [ "$existing_digest" != "$expected_digest" ]; then
+    mv -f "$staged_binary" "$destination"
+    staged_binary=''
+fi
+mv -f "$staged_marker" "$marker"
+staged_marker=''
+
+printf 'AVM %s is installed at %s.\n' "$version" "$destination"
+
+if [ "$no_init" -eq 1 ]; then
+    printf 'Shell initialization was skipped. No Argo CD version was installed or selected.\n'
+    if [ "$supports_init" -eq 1 ]; then
+        printf 'Run "%s" --avm-home "%s" init when you are ready.\n' "$destination" "$avm_home"
+    else
+        printf 'This legacy release uses setup; run "%s" --avm-home "%s" setup when you are ready.\n' "$destination" "$avm_home"
+    fi
+    exit 0
+fi
+
+set -- --avm-home "$avm_home" init
+if [ -n "$selected_shell" ]; then
+    set -- "$@" --shell "$selected_shell"
+fi
+if [ "$no_completion" -eq 1 ]; then
+    set -- "$@" --no-completion
+fi
+
+if ! "$destination" "$@"; then
+    printf '%s: error: AVM %s was installed, but shell initialization failed.\n' "$PROGRAM_NAME" "$version" >&2
+    printf 'No Argo CD version was installed or selected. Retry with:\n' >&2
+    printf '  "%s" --avm-home "%s" init\n' "$destination" "$avm_home" >&2
+    exit 1
+fi
+
+printf 'Open a new terminal, then run:\n'
+printf '  avm default stable\n'

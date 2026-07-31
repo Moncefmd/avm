@@ -18,9 +18,11 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const METADATA_FILE: &str = "install.json";
 const MAX_INSTALL_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_SHIM_METADATA_BYTES: u64 = 16 * 1024;
 const CACHE_SCHEMA: u32 = 1;
 const INSTALL_SCHEMA: u32 = 1;
-const SHIM_SCHEMA: u32 = 1;
+const SHIM_SCHEMA: u32 = 2;
+const SHIM_PROTOCOL: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -130,6 +132,11 @@ struct ReleaseCache {
 #[derive(Debug, Deserialize, Serialize)]
 struct ShimMetadata {
     schema: u32,
+    #[serde(default)]
+    protocol: u32,
+    #[serde(default)]
+    launcher_sha256: String,
+    #[serde(default)]
     avm_version: String,
     #[serde(default)]
     pending: bool,
@@ -210,6 +217,15 @@ impl Store {
         )
     }
 
+    pub(crate) fn lock_existing_state(&self, shared: bool) -> Result<Option<FileLock>> {
+        self.validate_existing_layout()?;
+        acquire_existing_lock(
+            &self.paths.locks.join("state.lock"),
+            shared,
+            "AVM integration state".to_owned(),
+        )
+    }
+
     pub fn version_dir(&self, version: &str) -> Result<PathBuf> {
         ensure_canonical_tag(version)?;
         let path = self.paths.versions.join(version);
@@ -227,7 +243,48 @@ impl Store {
 
     pub fn ensure_dispatcher(&self) -> Result<()> {
         let _state_lock = self.lock_state(false)?;
+        self.ensure_dispatcher_locked()
+    }
+
+    pub(crate) fn ensure_dispatcher_locked(&self) -> Result<()> {
         self.ensure_shim()
+    }
+
+    pub fn dispatcher_removal_is_safe(&self) -> Result<bool> {
+        self.validate_existing_layout()?;
+        validate_owned_dispatcher_pair(self)
+    }
+
+    pub fn remove_dispatcher(&self) -> Result<bool> {
+        self.validate_existing_layout()?;
+        if !validate_owned_dispatcher_pair(self)? {
+            return Ok(false);
+        }
+        let lock_path = self.paths.locks.join("state.lock");
+        let Some(_state_lock) =
+            acquire_existing_lock(&lock_path, false, "the AVM dispatcher".to_owned())?
+        else {
+            return Err(AvmError::Message(format!(
+                "cannot remove the AVM dispatcher because its state lock is missing: {}",
+                lock_path.display()
+            )));
+        };
+        self.remove_dispatcher_locked()
+    }
+
+    pub(crate) fn remove_dispatcher_locked(&self) -> Result<bool> {
+        self.validate_existing_layout()?;
+        if !validate_owned_dispatcher_pair(self)? {
+            return Ok(false);
+        }
+        let shim = self.shim_path();
+        let marker = self.paths.state.join("dispatcher.json");
+        // Remove the launcher first and retain the ownership marker as a
+        // cleanup journal until that succeeds. If the process stops between
+        // these two operations, the next uninit can safely remove the marker.
+        let shim_removed = remove_dispatcher_artifact(&shim)?;
+        let marker_removed = remove_dispatcher_artifact(&marker)?;
+        Ok(shim_removed || marker_removed)
     }
 
     pub fn is_installed(&self, version: &str) -> Result<bool> {
@@ -525,7 +582,6 @@ impl Store {
             return Err(AvmError::NotInstalled(version.to_owned()));
         }
         let _state_lock = self.lock_state(false)?;
-        self.ensure_shim()?;
         write_atomic(
             &self.paths.state.join("default"),
             format!("{version}\n").as_bytes(),
@@ -620,30 +676,13 @@ impl Store {
         }
 
         let marker = self.paths.state.join("dispatcher.json");
-        let marker_metadata = match fs::symlink_metadata(&marker) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(AvmError::io(format!("inspect {}", marker.display()), error));
-            }
+        let Some(metadata) = read_shim_metadata(&marker)? else {
+            return Ok(false);
         };
-        if is_link_like(&marker_metadata) || !marker_metadata.is_file() {
+        if !shim_metadata_is_current(&metadata) || metadata.pending {
             return Ok(false);
         }
-        let owned = fs::read(&marker)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ShimMetadata>(&bytes).ok());
-        let marker_is_healthy = owned.is_some_and(|metadata| {
-            metadata.schema == SHIM_SCHEMA
-                && !metadata.pending
-                && metadata.avm_version == env!("CARGO_PKG_VERSION")
-        });
-        if !marker_is_healthy {
-            return Ok(false);
-        }
-        let current = std::env::current_exe()
-            .map_err(|error| AvmError::io("locate the AVM executable", error))?;
-        files_have_same_contents(&shim, &current)
+        Ok(file_sha256(&shim)?.eq_ignore_ascii_case(&metadata.launcher_sha256))
     }
 
     pub fn load_release_cache(
@@ -736,32 +775,64 @@ impl Store {
                 return Err(AvmError::UnmanagedShim { path: shim });
             }
             Ok(metadata) if metadata.is_file() => {
-                let owned = fs::read(&marker)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<ShimMetadata>(&bytes).ok())
-                    .filter(|metadata| metadata.schema == SHIM_SCHEMA);
+                let owned = read_shim_metadata(&marker)?;
                 let Some(owned) = owned else {
                     return Err(AvmError::UnmanagedShim { path: shim });
                 };
-                let current = std::env::current_exe()
-                    .map_err(|error| AvmError::io("locate the AVM executable", error))?;
-                replace = owned.pending
-                    || owned.avm_version != env!("CARGO_PKG_VERSION")
-                    || !files_have_same_contents(&shim, &current)?;
+                if owned.schema == 1 && valid_legacy_shim_metadata(&owned) {
+                    if !legacy_dispatcher_is_owned(self, &owned, &shim)? {
+                        return Err(AvmError::UnmanagedShim { path: shim });
+                    }
+                    replace = true;
+                } else if shim_metadata_is_current(&owned) {
+                    let digest = file_sha256(&shim)?;
+                    if digest.eq_ignore_ascii_case(&owned.launcher_sha256) {
+                        if owned.pending {
+                            write_json_atomic(
+                                &marker,
+                                &ShimMetadata {
+                                    pending: false,
+                                    ..owned
+                                },
+                            )?;
+                        }
+                        replace = false;
+                    }
+                } else {
+                    return Err(AvmError::UnmanagedShim { path: shim });
+                }
             }
             Ok(_) => return Err(AvmError::UnmanagedShim { path: shim }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(owned) = read_shim_metadata(&marker)?
+                    && !shim_metadata_is_current(&owned)
+                    && !valid_legacy_shim_metadata(&owned)
+                {
+                    return Err(AvmError::UnmanagedShim { path: shim });
+                }
+            }
             Err(error) => return Err(AvmError::io(format!("inspect {}", shim.display()), error)),
         }
 
         if replace {
+            let current = std::env::current_exe()
+                .map_err(|error| AvmError::io("locate the AVM executable", error))?;
+            let launcher_sha256 = file_sha256(&current)?;
             let pending = ShimMetadata {
                 schema: SHIM_SCHEMA,
-                avm_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol: SHIM_PROTOCOL,
+                launcher_sha256,
+                avm_version: String::new(),
                 pending: true,
             };
             write_json_atomic(&marker, &pending)?;
             copy_current_executable_atomic(&shim)?;
+            if !file_sha256(&shim)?.eq_ignore_ascii_case(&pending.launcher_sha256) {
+                return Err(AvmError::Message(format!(
+                    "the AVM dispatcher launcher at {} did not match its ownership digest",
+                    shim.display()
+                )));
+            }
             let complete = ShimMetadata {
                 pending: false,
                 ..pending
@@ -770,6 +841,140 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn dispatcher_artifact_presence(store: &Store) -> Result<(bool, bool)> {
+    let shim_exists = path_exists_without_following(&store.shim_path())?;
+    let marker_exists = path_exists_without_following(&store.paths.state.join("dispatcher.json"))?;
+    Ok((shim_exists, marker_exists))
+}
+
+fn validate_owned_dispatcher_pair(store: &Store) -> Result<bool> {
+    let (shim_exists, marker_exists) = dispatcher_artifact_presence(store)?;
+    match (shim_exists, marker_exists) {
+        (false, false) => return Ok(false),
+        (true, false) => {
+            return Err(AvmError::UnmanagedShim {
+                path: store.shim_path(),
+            });
+        }
+        (false, true) => {
+            let marker = store.paths.state.join("dispatcher.json");
+            let Some(owned) = read_shim_metadata(&marker)? else {
+                unreachable!("the marker was inspected as present")
+            };
+            if shim_metadata_is_current(&owned) || valid_legacy_shim_metadata(&owned) {
+                return Ok(true);
+            }
+            return Err(AvmError::UnmanagedShim { path: marker });
+        }
+        (true, true) => {}
+    }
+    let shim = store.shim_path();
+    let metadata = fs::symlink_metadata(&shim)
+        .map_err(|error| AvmError::io(format!("inspect {}", shim.display()), error))?;
+    if is_link_like(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+        return Err(AvmError::UnmanagedShim { path: shim });
+    }
+
+    let marker = store.paths.state.join("dispatcher.json");
+    let Some(owned) = read_shim_metadata(&marker)? else {
+        return Err(AvmError::UnmanagedShim { path: shim });
+    };
+    if shim_metadata_is_current(&owned) {
+        if file_sha256(&shim)?.eq_ignore_ascii_case(&owned.launcher_sha256) {
+            return Ok(true);
+        }
+        return Err(AvmError::UnmanagedShim { path: shim });
+    }
+    if valid_legacy_shim_metadata(&owned) && legacy_dispatcher_is_owned(store, &owned, &shim)? {
+        return Ok(true);
+    }
+    Err(AvmError::UnmanagedShim { path: shim })
+}
+
+fn remove_dispatcher_artifact(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AvmError::io(format!("remove {}", path.display()), error)),
+    }
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AvmError::io(format!("inspect {}", path.display()), error)),
+    }
+}
+
+fn read_shim_metadata(path: &Path) -> Result<Option<ShimMetadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AvmError::io(format!("inspect {}", path.display()), error)),
+    };
+    if is_link_like(&metadata)
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_SHIM_METADATA_BYTES
+    {
+        return Err(AvmError::UnmanagedShim {
+            path: path.to_path_buf(),
+        });
+    }
+    let bytes =
+        fs::read(path).map_err(|error| AvmError::io(format!("read {}", path.display()), error))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| AvmError::UnmanagedShim {
+            path: path.to_path_buf(),
+        })
+}
+
+fn shim_metadata_is_current(metadata: &ShimMetadata) -> bool {
+    metadata.schema == SHIM_SCHEMA
+        && metadata.protocol == SHIM_PROTOCOL
+        && valid_sha256(&metadata.launcher_sha256)
+}
+
+fn valid_legacy_shim_metadata(metadata: &ShimMetadata) -> bool {
+    metadata.schema == 1
+        && !metadata.pending
+        && !metadata.avm_version.is_empty()
+        && semver::Version::parse(&metadata.avm_version).is_ok()
+}
+
+fn legacy_dispatcher_digest(store: &Store, metadata: &ShimMetadata) -> Option<&'static str> {
+    if metadata.avm_version != "1.0.0" {
+        return None;
+    }
+    match store.platform.asset_name().as_str() {
+        "argocd-darwin-amd64" => {
+            Some("b96a1d615e6884a912493522196b84d6ef598e94f9d198f828f93a0312d443b6")
+        }
+        "argocd-darwin-arm64" => {
+            Some("ad3f19096c742d0bc0a04ab9e89e3ee2e349b9db63259a4d76b27f4dab279f7a")
+        }
+        "argocd-linux-amd64" => {
+            Some("a58b2a8e822fa092a763a7511355b578384864302676ef03805e671bfd3e2e96")
+        }
+        "argocd-linux-arm64" => {
+            Some("d5445a63a0ea9991e5d2a456bb5a640f581541ab09801f57c86da968aa89f083")
+        }
+        "argocd-windows-amd64.exe" => {
+            Some("b2c007ae88923712789aeedba616f5ef1112e649033acb1ada4f42e75b99f780")
+        }
+        _ => None,
+    }
+}
+
+fn legacy_dispatcher_is_owned(store: &Store, metadata: &ShimMetadata, shim: &Path) -> Result<bool> {
+    let Some(expected) = legacy_dispatcher_digest(store, metadata) else {
+        return Ok(false);
+    };
+    Ok(file_sha256(shim)?.eq_ignore_ascii_case(expected))
 }
 
 fn ensure_canonical_tag(tag: &str) -> Result<()> {
@@ -913,40 +1118,26 @@ fn acquire_open_lock(file: File, path: &Path, shared: bool, label: String) -> Re
     }
 }
 
-fn files_have_same_contents(left: &Path, right: &Path) -> Result<bool> {
-    let left_metadata = fs::symlink_metadata(left)
-        .map_err(|error| AvmError::io(format!("inspect {}", left.display()), error))?;
-    let right_metadata = fs::symlink_metadata(right)
-        .map_err(|error| AvmError::io(format!("inspect {}", right.display()), error))?;
-    if is_link_like(&left_metadata)
-        || is_link_like(&right_metadata)
-        || !left_metadata.is_file()
-        || !right_metadata.is_file()
-        || left_metadata.len() != right_metadata.len()
-    {
-        return Ok(false);
+fn file_sha256(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| AvmError::io(format!("inspect {}", path.display()), error))?;
+    if is_link_like(&metadata) || !metadata.is_file() || metadata.len() == 0 {
+        return Err(AvmError::UnsafePath(path.to_path_buf()));
     }
-
-    let mut left_file = File::open(left)
-        .map_err(|error| AvmError::io(format!("open {}", left.display()), error))?;
-    let mut right_file = File::open(right)
-        .map_err(|error| AvmError::io(format!("open {}", right.display()), error))?;
-    let mut left_buffer = [0u8; 64 * 1024];
-    let mut right_buffer = [0u8; 64 * 1024];
+    let mut file = File::open(path)
+        .map_err(|error| AvmError::io(format!("open {}", path.display()), error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
     loop {
-        let left_read = left_file
-            .read(&mut left_buffer)
-            .map_err(|error| AvmError::io(format!("read {}", left.display()), error))?;
-        let right_read = right_file
-            .read(&mut right_buffer)
-            .map_err(|error| AvmError::io(format!("read {}", right.display()), error))?;
-        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
-            return Ok(false);
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| AvmError::io(format!("read {}", path.display()), error))?;
+        if read == 0 {
+            break;
         }
-        if left_read == 0 {
-            return Ok(true);
-        }
+        hasher.update(&buffer[..read]);
     }
+    Ok(hex_digest(&hasher.finalize()))
 }
 
 fn copy_current_executable_atomic(destination: &Path) -> Result<()> {
@@ -1310,7 +1501,7 @@ mod tests {
         let shim = store.shim_path();
         fs::write(&shim, b"user-owned").unwrap();
 
-        let error = store.set_default("v3.4.5").unwrap_err();
+        let error = store.ensure_dispatcher().unwrap_err();
         assert!(matches!(error, AvmError::UnmanagedShim { .. }));
         assert_eq!(fs::read(&shim).unwrap(), b"user-owned");
     }
@@ -1331,13 +1522,198 @@ mod tests {
     fn detects_and_repairs_a_modified_managed_shim() {
         let (_temp, store) = test_store();
         install_dummy(&store, "v3.4.5");
-        store.set_default("v3.4.5").unwrap();
+        store.ensure_dispatcher().unwrap();
         assert!(store.shim_is_healthy().unwrap());
 
         fs::write(store.shim_path(), b"modified").unwrap();
         assert!(!store.shim_is_healthy().unwrap());
-        store.set_default("v3.4.5").unwrap();
+        store.ensure_dispatcher().unwrap();
         assert!(store.shim_is_healthy().unwrap());
+    }
+
+    #[test]
+    fn dispatcher_health_is_bound_to_protocol_and_digest_not_avm_version() {
+        let (_temp, store) = test_store();
+        store.ensure_dispatcher().unwrap();
+        let marker = store.paths.state.join("dispatcher.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        metadata["avm_version"] = serde_json::Value::String("0.0.0".to_owned());
+        fs::write(&marker, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
+
+        assert!(store.shim_is_healthy().unwrap());
+        let before = file_sha256(&store.shim_path()).unwrap();
+        store.ensure_dispatcher().unwrap();
+        assert_eq!(file_sha256(&store.shim_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn removes_only_an_owned_unmodified_dispatcher_and_is_idempotent() {
+        let (_temp, store) = test_store();
+        install_dummy(&store, "v3.4.5");
+        store.set_default("v3.4.5").unwrap();
+        store.ensure_dispatcher().unwrap();
+
+        assert!(store.dispatcher_removal_is_safe().unwrap());
+        assert!(store.remove_dispatcher().unwrap());
+        assert!(!store.shim_path().exists());
+        assert!(!store.paths.state.join("dispatcher.json").exists());
+        assert_eq!(store.default_version().unwrap().as_deref(), Some("v3.4.5"));
+        assert!(store.is_installed("v3.4.5").unwrap());
+        assert!(!store.remove_dispatcher().unwrap());
+    }
+
+    #[test]
+    fn removes_a_current_marker_left_after_the_launcher_and_is_idempotent() {
+        let (_temp, store) = test_store();
+        store.ensure_dispatcher().unwrap();
+        let marker = store.paths.state.join("dispatcher.json");
+
+        // This is the state left if cleanup stops after removing the launcher
+        // but before removing its ownership journal.
+        fs::remove_file(store.shim_path()).unwrap();
+
+        assert!(store.dispatcher_removal_is_safe().unwrap());
+        assert!(store.remove_dispatcher().unwrap());
+        assert!(!marker.exists());
+        assert!(!store.remove_dispatcher().unwrap());
+    }
+
+    #[test]
+    fn removes_a_legacy_marker_left_after_the_launcher() {
+        let (_temp, store) = test_store();
+        store.ensure_layout().unwrap();
+        drop(store.lock_state(false).unwrap());
+        let marker = store.paths.state.join("dispatcher.json");
+        write_json_atomic(
+            &marker,
+            &ShimMetadata {
+                schema: 1,
+                protocol: 0,
+                launcher_sha256: String::new(),
+                avm_version: "1.0.0".to_owned(),
+                pending: false,
+            },
+        )
+        .unwrap();
+
+        assert!(store.dispatcher_removal_is_safe().unwrap());
+        assert!(store.remove_dispatcher().unwrap());
+        assert!(!store.shim_path().exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn published_v1_dispatcher_digests_cover_every_release_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let metadata = ShimMetadata {
+            schema: 1,
+            protocol: 0,
+            launcher_sha256: String::new(),
+            avm_version: "1.0.0".to_owned(),
+            pending: false,
+        };
+        let cases = [
+            (
+                Platform::from_target("macos", "x86_64", true).unwrap(),
+                "b96a1d615e6884a912493522196b84d6ef598e94f9d198f828f93a0312d443b6",
+            ),
+            (
+                Platform::from_target("macos", "aarch64", true).unwrap(),
+                "ad3f19096c742d0bc0a04ab9e89e3ee2e349b9db63259a4d76b27f4dab279f7a",
+            ),
+            (
+                Platform::from_target("linux", "x86_64", true).unwrap(),
+                "a58b2a8e822fa092a763a7511355b578384864302676ef03805e671bfd3e2e96",
+            ),
+            (
+                Platform::from_target("linux", "aarch64", true).unwrap(),
+                "d5445a63a0ea9991e5d2a456bb5a640f581541ab09801f57c86da968aa89f083",
+            ),
+            (
+                Platform::from_target("windows", "x86_64", true).unwrap(),
+                "b2c007ae88923712789aeedba616f5ef1112e649033acb1ada4f42e75b99f780",
+            ),
+        ];
+
+        for (platform, expected) in cases {
+            let store = Store::new(Paths::new(temporary.path().join(".avm")), platform);
+            assert_eq!(legacy_dispatcher_digest(&store, &metadata), Some(expected));
+        }
+    }
+
+    #[test]
+    fn refuses_to_remove_a_modified_legacy_dispatcher() {
+        let (_temp, store) = test_store();
+        store.ensure_layout().unwrap();
+        drop(store.lock_state(false).unwrap());
+        let marker = store.paths.state.join("dispatcher.json");
+        fs::write(store.shim_path(), b"modified legacy launcher").unwrap();
+        write_json_atomic(
+            &marker,
+            &ShimMetadata {
+                schema: 1,
+                protocol: 0,
+                launcher_sha256: String::new(),
+                avm_version: "1.0.0".to_owned(),
+                pending: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.dispatcher_removal_is_safe(),
+            Err(AvmError::UnmanagedShim { .. })
+        ));
+        assert!(matches!(
+            store.remove_dispatcher(),
+            Err(AvmError::UnmanagedShim { .. })
+        ));
+        assert!(store.shim_path().exists());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn refuses_to_remove_a_modified_dispatcher() {
+        let (_temp, store) = test_store();
+        store.ensure_dispatcher().unwrap();
+        let marker = store.paths.state.join("dispatcher.json");
+        fs::write(store.shim_path(), b"modified").unwrap();
+
+        assert!(matches!(
+            store.dispatcher_removal_is_safe(),
+            Err(AvmError::UnmanagedShim { .. })
+        ));
+        assert!(store.shim_path().exists());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn refuses_to_migrate_a_modified_legacy_dispatcher() {
+        let (_temp, store) = test_store();
+        store.ensure_layout().unwrap();
+        fs::write(store.shim_path(), b"legacy launcher").unwrap();
+        write_json_atomic(
+            &store.paths.state.join("dispatcher.json"),
+            &ShimMetadata {
+                schema: 1,
+                protocol: 0,
+                launcher_sha256: String::new(),
+                avm_version: "1.0.0".to_owned(),
+                pending: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.ensure_dispatcher(),
+            Err(AvmError::UnmanagedShim { .. })
+        ));
+        let metadata = read_shim_metadata(&store.paths.state.join("dispatcher.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.schema, 1);
+        assert_eq!(fs::read(store.shim_path()).unwrap(), b"legacy launcher");
     }
 
     #[test]
