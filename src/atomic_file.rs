@@ -387,15 +387,19 @@ mod tests {
     fn windows_replacement_preserves_a_protected_dacl() {
         const PROTECT_ACL: &str = r#"
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $env:AVM_ACL_TEST_PATH
+$acl = [IO.File]::GetAccessControl($env:AVM_ACL_TEST_PATH)
 $acl.SetAccessRuleProtection($true, $true)
-Set-Acl -LiteralPath $env:AVM_ACL_TEST_PATH -AclObject $acl
+[IO.File]::SetAccessControl($env:AVM_ACL_TEST_PATH, $acl)
 "#;
-        const READ_SDDL: &str = "(Get-Acl -LiteralPath $env:AVM_ACL_TEST_PATH).Sddl";
+        const READ_SDDL: &str = r#"
+([IO.File]::GetAccessControl($env:AVM_ACL_TEST_PATH)).GetSecurityDescriptorSddlForm(
+    [Security.AccessControl.AccessControlSections]::All
+)
+"#;
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("profile.ps1");
         fs::write(&path, "before").unwrap();
-        let status = std::process::Command::new("powershell.exe")
+        let status = std::process::Command::new(crate::windows::trusted_powershell().unwrap())
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -433,7 +437,7 @@ Set-Acl -LiteralPath $env:AVM_ACL_TEST_PATH -AclObject $acl
 
     #[cfg(windows)]
     fn powershell_output(path: &Path, script: &str) -> String {
-        let output = std::process::Command::new("powershell.exe")
+        let output = std::process::Command::new(crate::windows::trusted_powershell().unwrap())
             .args([
                 "-NoLogo",
                 "-NoProfile",
