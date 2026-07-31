@@ -5,9 +5,14 @@ use std::process::Command as ProcessCommand;
 
 use crate::cli::Shell;
 use crate::error::{AvmError, Result};
+#[cfg(any(windows, test))]
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::{self, FileSnapshot, PlannedDelete, PlannedWrite};
+#[cfg(any(windows, test))]
+use crate::atomic_file::FileSnapshot;
+#[cfg(windows)]
+use crate::atomic_file::PlannedWrite;
+use crate::atomic_file::{self, PlannedDelete};
 use crate::profile::{self, BlockRemovalRequest, BlockRequest, ProfileFormat};
 use crate::store::Store;
 
@@ -15,7 +20,9 @@ const PROFILE_BLOCK_START: &str = "# >>> avm init >>>";
 const PROFILE_BLOCK_END: &str = "# <<< avm init <<<";
 const LEGACY_PROFILE_BLOCK_START: &str = "# >>> avm setup >>>";
 const LEGACY_PROFILE_BLOCK_END: &str = "# <<< avm setup <<<";
+#[cfg(any(windows, test))]
 const INTEGRATION_SCHEMA: u32 = 1;
+#[cfg(windows)]
 const MAX_INTEGRATION_METADATA_BYTES: u64 = 16 * 1024;
 
 #[cfg(windows)]
@@ -164,6 +171,7 @@ if ($removed) {
 }
 "#;
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Deserialize, Serialize)]
 struct IntegrationMetadata {
     schema: u32,
@@ -294,6 +302,7 @@ fn apply_windows_user_path_with_receipt(store: &Store, bin: &Path) -> Result<()>
     }
 }
 
+#[cfg(any(windows, test))]
 impl IntegrationMetadata {
     fn settled(windows_user_path_added: bool) -> Self {
         Self {
@@ -359,10 +368,12 @@ fn apply_windows_user_path(bin: &Path) -> Result<WindowsPathUpdate> {
     }
 }
 
+#[cfg(windows)]
 fn integration_metadata_path(store: &Store) -> PathBuf {
     store.paths.state.join("integration.json")
 }
 
+#[cfg(windows)]
 fn load_integration_metadata(store: &Store) -> Result<Option<IntegrationMetadata>> {
     let path = integration_metadata_path(store);
     let snapshot = atomic_file::read_snapshot(
@@ -373,6 +384,7 @@ fn load_integration_metadata(store: &Store) -> Result<Option<IntegrationMetadata
     parse_integration_metadata(&path, &snapshot)
 }
 
+#[cfg(any(windows, test))]
 fn parse_integration_metadata(
     path: &Path,
     snapshot: &FileSnapshot,
@@ -395,6 +407,7 @@ fn parse_integration_metadata(
     Ok(Some(metadata))
 }
 
+#[cfg(windows)]
 fn write_integration_metadata(store: &Store, metadata: &IntegrationMetadata) -> Result<()> {
     let path = integration_metadata_path(store);
     let snapshot = atomic_file::read_snapshot(
@@ -653,6 +666,8 @@ pub(crate) fn preflight_windows_path_cleanup(plan: &WindowsPathCleanup) -> Resul
 }
 
 pub(crate) fn apply_windows_path_cleanup(store: &Store, plan: WindowsPathCleanup) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = store;
     match plan {
         WindowsPathCleanup::NotApplicable => Ok(()),
         WindowsPathCleanup::PreserveUnowned { receipt } => {
@@ -667,6 +682,8 @@ pub(crate) fn apply_windows_path_cleanup(store: &Store, plan: WindowsPathCleanup
         } => {
             #[cfg(windows)]
             remove_windows_user_path(&store.paths.bin, equivalent)?;
+            #[cfg(not(windows))]
+            let _ = equivalent;
             if let Some(receipt) = receipt {
                 atomic_file::apply_delete(receipt)?;
             }
