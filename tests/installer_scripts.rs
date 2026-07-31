@@ -21,6 +21,7 @@ fn installer_templates_have_one_release_placeholder() {
     assert_eq!(POWERSHELL_TEMPLATE.matches(RELEASE_PLACEHOLDER).count(), 1);
     assert!(POSIX_TEMPLATE.starts_with("#!/bin/sh\n"));
     assert!(POWERSHELL_TEMPLATE.starts_with("& {\n    [CmdletBinding()]\n"));
+    assert!(!POWERSHELL_TEMPLATE.contains("Get-FileHash"));
 }
 
 #[cfg(windows)]
@@ -124,6 +125,42 @@ fn powershell_installer_verifies_installs_and_replaces_only_managed_avm() {
             .output()
             .unwrap()
     };
+
+    let staged_digest = "        $actualDigest = Get-Sha256Hex -Path $stagedBinary";
+    assert_eq!(rendered.matches(staged_digest).count(), 1);
+    let command_failure_installer = temp.path().join("install-command-failure.ps1");
+    fs::write(
+        &command_failure_installer,
+        rendered.replace(
+            staged_digest,
+            "        $actualDigest = Get-DefinitelyMissingAvmCommand $stagedBinary",
+        ),
+    )
+    .unwrap();
+    let command_failure_home = temp.path().join("command failure home");
+    let command_failure = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&command_failure_installer)
+        .args(["-NoInit", "-AvmHome"])
+        .arg(&command_failure_home)
+        .env("AVM_TEST_CHECKSUM", &checksum)
+        .env("AVM_TEST_BINARY", env!("CARGO_BIN_EXE_avm"))
+        .output()
+        .unwrap();
+    assert!(
+        !command_failure.status.success(),
+        "installer command failure returned success\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&command_failure.stdout),
+        String::from_utf8_lossy(&command_failure.stderr)
+    );
+    assert!(!command_failure_home.join("bin/avm.exe").exists());
 
     for attempt in 1..=2 {
         let output = run();
