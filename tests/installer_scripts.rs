@@ -103,6 +103,8 @@ fn powershell_installer_verifies_installs_and_replaces_only_managed_avm() {
     )
     .unwrap();
     let avm_home = temp.path().join("avm home");
+    let destination = avm_home.join("bin/avm.exe");
+    let marker = avm_home.join("bin/avm.exe.sha256");
 
     let run = || -> Output {
         Command::new("powershell.exe")
@@ -123,7 +125,7 @@ fn powershell_installer_verifies_installs_and_replaces_only_managed_avm() {
             .unwrap()
     };
 
-    for _ in 0..2 {
+    for attempt in 1..=2 {
         let output = run();
         assert!(
             output.status.success(),
@@ -131,10 +133,21 @@ fn powershell_installer_verifies_installs_and_replaces_only_managed_avm() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            destination.is_file(),
+            "installer run {attempt} succeeded but {} is missing\nAVM home: {:?}\nAVM bin: {:?}\nstdout: {}\nstderr: {}",
+            destination.display(),
+            fs::read_dir(&avm_home).map(|entries| entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>()),
+            fs::read_dir(avm_home.join("bin")).map(|entries| entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    let destination = avm_home.join("bin/avm.exe");
-    let marker = avm_home.join("bin/avm.exe.sha256");
     assert_eq!(fs::read(&destination).unwrap(), release_binary);
     assert!(marker.is_file());
 
